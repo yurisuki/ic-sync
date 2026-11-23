@@ -563,6 +563,9 @@ impl EngineInner {
                 if watcher_inner.is_shutdown() {
                     break;
                 }
+                // Let atomic writes/temp renames settle before inspecting the
+                // file; otherwise hydration writes look like user edits.
+                sleep(Duration::from_millis(300)).await;
                 let folder = watcher_inner.cfg().sync_folder;
                 let relative = path.strip_prefix(&folder).unwrap_or(&path);
                 if relative.as_os_str().is_empty() {
@@ -1136,6 +1139,40 @@ impl EngineInner {
             }
         }
         let mut dirty = self.state.list_dirty()?;
+        // Hydration may leave dirty rows whose content already matches the
+        // stored checksum. Re-uploading them is pointless and produced hundreds
+        // of queued modify ops, leaving the UI stuck at "syncing".
+        let already_clean: Vec<String> = dirty
+            .iter()
+            .filter(|entry| {
+                !entry.tombstone
+                    && !entry.is_dir()
+                    && entry.remote_drivewsid.is_some()
+                    && entry.local_sha256.is_some()
+            })
+            .filter(|entry| {
+                let local = match self.mirror.local_path(&entry.path) {
+                    Ok(path) => path,
+                    Err(_) => return false,
+                };
+                if !local.is_file() {
+                    return false;
+                }
+                match self.mirror.sha256(&entry.path) {
+                    Ok(hash) => Some(hash) == entry.local_sha256,
+                    Err(_) => false,
+                }
+            })
+            .map(|entry| entry.path.clone())
+            .collect();
+        if !already_clean.is_empty() {
+            let now = chrono::Utc::now().timestamp();
+            for path in already_clean {
+                self.state.clear_pending_subtree(&path)?;
+                self.state.mark_clean(&path, now, None)?;
+            }
+            dirty = self.state.list_dirty()?;
+        }
         // Conflict copies are local-only by design. They must never be
         // uploaded, and their stale queued operations must not be retried.
         let conflict_paths: Vec<String> = self
