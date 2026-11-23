@@ -6,7 +6,7 @@
 //! only calls the small public surface on [`SyncEngine`].
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 use std::time::Duration;
 
-use notify::{RecursiveMode, Watcher};
+use notify::event::{EventKind, ModifyKind, RenameMode};
+use notify::{Event, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
@@ -26,13 +27,140 @@ use crate::api::{
 };
 use crate::config::{self, Config};
 use crate::error::{Error, Result};
-use crate::mirror::{Mirror, basename, conflict_path, join_path, parent_path};
+#[cfg(test)]
+use crate::mirror::conflict_path;
+use crate::mirror::{Mirror, basename, join_path, parent_path};
 use crate::relocation::{self, RelocationReport};
 use crate::state::{Database, Entry};
-use crate::status::{ServiceStatus, SyncState, write_status};
+use crate::status::{ServiceStatus, SyncState, write_status_to};
 
 /// Delay used to coalesce bursts of local file events into one remote crawl.
 const REMOTE_WAKE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// Let a burst of Create/Modify/Rename events settle before deciding what a
+/// local file operation actually was (editors emit several events per save).
+const LOCAL_EVENT_SETTLE: Duration = Duration::from_millis(300);
+
+/// A local filesystem event reduced to the operation it may represent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalAction {
+    Change(PathBuf),
+    Delete(PathBuf),
+    /// A single notify `Rename(Both { from, to })` event.
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// The two halves of a rename on backends that emit From/To separately.
+    RenameFrom(PathBuf),
+    RenameTo(PathBuf),
+}
+
+/// Ignore the engine's own atomic-write scratch files (`.<name>.<uuid>.tmp`)
+/// and conflict copies; they are never user-visible iCloud nodes.
+fn is_internal_local_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.contains(".local-conflict-") || (name.starts_with('.') && name.ends_with(".tmp"))
+}
+
+/// Map a notify event kind to a local action. All four mutation families are
+/// handled: Create, Modify (including name changes), Remove and Rename.
+fn action_from_event(event: &Event) -> Option<LocalAction> {
+    match &event.kind {
+        EventKind::Create(_) => event.paths.first().cloned().map(LocalAction::Change),
+        EventKind::Remove(_) => event.paths.first().cloned().map(LocalAction::Delete),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            // notify puts (from, to) in event.paths for a combined rename.
+            match event.paths.as_slice() {
+                [from, to, ..] => Some(LocalAction::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                }),
+                _ => None,
+            }
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            event.paths.first().cloned().map(LocalAction::RenameFrom)
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            event.paths.first().cloned().map(LocalAction::RenameTo)
+        }
+        EventKind::Modify(_) | EventKind::Any | EventKind::Other => {
+            event.paths.first().cloned().map(LocalAction::Change)
+        }
+        EventKind::Access(_) => None,
+    }
+}
+
+/// Collapse a settled batch into one action per path, pairing split rename
+/// events and preferring the filesystem's current state for ambiguous paths.
+fn settle_actions(
+    actions: Vec<LocalAction>,
+    is_present: impl Fn(&Path) -> bool,
+) -> Vec<LocalAction> {
+    let mut result = Vec::new();
+    let mut touched = HashSet::new();
+    let mut rename_from = VecDeque::new();
+    let mut rename_to = VecDeque::new();
+    let mut simple = Vec::new();
+
+    for action in actions {
+        match action {
+            LocalAction::Rename { from, to } => {
+                result.push(LocalAction::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+                touched.insert(from);
+                touched.insert(to);
+            }
+            LocalAction::RenameFrom(path) => rename_from.push_back(path),
+            LocalAction::RenameTo(path) => rename_to.push_back(path),
+            other => simple.push(other),
+        }
+    }
+    while let (Some(from), Some(to)) = (rename_from.pop_front(), rename_to.pop_front()) {
+        result.push(LocalAction::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        });
+        touched.insert(from);
+        touched.insert(to);
+    }
+    for path in rename_from {
+        simple.push(LocalAction::Delete(path));
+    }
+    for path in rename_to {
+        simple.push(LocalAction::Change(path));
+    }
+    // Last write wins per path; existence breaks ties between Create/Remove.
+    let mut by_path: Vec<(PathBuf, LocalAction)> = Vec::new();
+    for action in simple {
+        let path = match &action {
+            LocalAction::Change(path) | LocalAction::Delete(path) => path.clone(),
+            _ => unreachable!(),
+        };
+        if touched.contains(&path) {
+            continue;
+        }
+        if let Some(existing) = by_path.iter_mut().find(|(p, _)| *p == path) {
+            existing.1 = action;
+        } else {
+            by_path.push((path, action));
+        }
+    }
+    for (path, action) in by_path {
+        let present = is_present(&path);
+        let action = match action {
+            LocalAction::Change(_) if !present => LocalAction::Delete(path.clone()),
+            LocalAction::Delete(_) if present => LocalAction::Change(path.clone()),
+            other => other,
+        };
+        result.push(action);
+    }
+    result
+}
 
 /// Coalescing wake signal for the remote crawl loop. `Notify` stores at most
 /// one permit, so any number of requests during a debounce window produce a
@@ -103,10 +231,16 @@ struct EngineInner {
     downloads: mpsc::UnboundedSender<String>,
     download_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
     scheduled: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Files currently being written by hydration. The watcher must not treat
+    /// these self-generated writes (or their atomic `.tmp` siblings) as edits.
+    hydrating: Arc<std::sync::Mutex<HashSet<String>>>,
     download_slots: Arc<Semaphore>,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     watcher: std::sync::Mutex<Option<notify::RecommendedWatcher>>,
     status_cache: std::sync::Mutex<ServiceStatus>,
+    /// Status document written by this engine (injectable in tests so a test
+    /// can never clobber the user's live status file).
+    status_path: PathBuf,
     /// Set by the first successful crawl; gates stale-row purging so an empty
     /// pre-crawl view can never wipe a legitimate cache.
     remote_view: std::sync::Mutex<Option<RemoteView>>,
@@ -124,6 +258,14 @@ pub struct SyncEngine {
 
 impl SyncEngine {
     pub async fn new(api: Arc<ICloudApi>, config: Config) -> Result<Self> {
+        Self::new_with_status_path(api, config, crate::status::status_file()?).await
+    }
+
+    async fn new_with_status_path(
+        api: Arc<ICloudApi>,
+        config: Config,
+        status_path: PathBuf,
+    ) -> Result<Self> {
         config.validate()?;
         crate::paths::ensure_layout()?;
         let state = Arc::new(Database::open(&config.state_db())?);
@@ -144,10 +286,12 @@ impl SyncEngine {
             downloads,
             download_rx: Arc::new(Mutex::new(download_rx)),
             scheduled: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            hydrating: Arc::new(std::sync::Mutex::new(HashSet::new())),
             download_slots: Arc::new(Semaphore::new(workers)),
             tasks: std::sync::Mutex::new(Vec::new()),
             watcher: std::sync::Mutex::new(None),
             status_cache: std::sync::Mutex::new(status),
+            status_path,
             remote_view: std::sync::Mutex::new(None),
             last_sync_at: AtomicI64::new(last),
             self_ref: std::sync::OnceLock::new(),
@@ -350,8 +494,22 @@ impl EngineInner {
             .with_folder(cfg.sync_folder.to_string_lossy().into_owned())
             .with_secure_storage(config::credential_storage_ready(cfg.credential_mode));
         *self.status_cache.lock().unwrap() = status.clone();
-        if let Err(error) = write_status(&status) {
+        if let Err(error) = write_status_to(&self.status_path, &status) {
             warn!("could not write status file: {error}");
+        }
+    }
+
+    /// Every sync path ends here, so `Syncing` is never the terminal state of
+    /// a completed or failed operation (including callers that ignore `Err`).
+    fn finish_sync(&self, result: &Result<()>, success_message: &str) {
+        match result {
+            Ok(()) => {
+                if let Err(error) = self.state.prune_pending_ops() {
+                    debug!("could not prune pending ops: {error}");
+                }
+                self.publish(SyncState::Synced, success_message);
+            }
+            Err(error) => self.report_error(error),
         }
     }
 
@@ -423,16 +581,27 @@ impl EngineInner {
         // The remote snapshot is authoritative. Rebuilding from the cached DB
         // here is what resurrects folders that were deleted locally/remotely.
         info!("rebuilding local mirror from current iCloud metadata");
-        self.crawl_and_apply().await?;
-        self.schedule_all_unhydrated()?;
+        let mut startup_error: Option<Error> = None;
+        if let Err(error) = self.crawl_and_apply().await {
+            startup_error = Some(error);
+        } else if let Err(error) = self.schedule_all_unhydrated() {
+            startup_error = Some(error);
+        }
 
+        // Always start the background loops, even when the first crawl failed:
+        // a transient Apple error must not disable local watching/uploads (that
+        // left the app showing "Syncing" while nothing was ever synced).
+        let mut watcher_error = None;
         if self.cfg().auto_sync {
             self.spawn_remote_loop();
             self.spawn_upload_loop();
-            self.spawn_local_watcher()?;
+            watcher_error = self.spawn_local_watcher().err();
         }
         self.set_next_sync();
-        self.publish(SyncState::Synced, "iCloud up to date");
+        match startup_error.or(watcher_error) {
+            Some(error) => self.report_error(&error),
+            None => self.publish(SyncState::Synced, "iCloud up to date"),
+        }
         Ok(())
     }
 
@@ -469,6 +638,7 @@ impl EngineInner {
 
     fn spawn_status_loop(&self) {
         let publisher = self.self_arc();
+        let status_path = self.status_path.clone();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
@@ -477,7 +647,7 @@ impl EngineInner {
                     break;
                 }
                 let status = publisher.status();
-                if let Err(error) = write_status(&status) {
+                if let Err(error) = write_status_to(&status_path, &status) {
                     warn!("could not write status file: {error}");
                 }
             }
@@ -542,12 +712,21 @@ impl EngineInner {
     }
 
     fn spawn_local_watcher(&self) -> Result<()> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<PathBuf>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<LocalAction>();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                for path in event.paths {
-                    let _ = tx.send(path);
+            let Ok(event) = res else { return };
+            if let Some(action) = action_from_event(&event) {
+                let paths = match &action {
+                    LocalAction::Rename { from, to } => vec![from.clone(), to.clone()],
+                    LocalAction::Change(path)
+                    | LocalAction::Delete(path)
+                    | LocalAction::RenameFrom(path)
+                    | LocalAction::RenameTo(path) => vec![path.clone()],
+                };
+                if paths.iter().any(|path| is_internal_local_path(path)) {
+                    return;
                 }
+                let _ = tx.send(action);
             }
         })
         .map_err(|e| Error::other(format!("could not start local watcher: {e}")))?;
@@ -556,42 +735,32 @@ impl EngineInner {
             .watch(&folder, RecursiveMode::Recursive)
             .map_err(|e| Error::other(format!("could not watch {}: {e}", folder.display())))?;
         *self.watcher.lock().unwrap() = Some(watcher);
+        info!("watching {folder:?} for local changes");
 
         let watcher_inner = self.self_arc();
         let task = tokio::spawn(async move {
-            while let Some(path) = rx.recv().await {
-                if watcher_inner.is_shutdown() {
-                    break;
-                }
-                // Let atomic writes/temp renames settle before inspecting the
-                // file; otherwise hydration writes look like user edits.
-                sleep(Duration::from_millis(300)).await;
-                let folder = watcher_inner.cfg().sync_folder;
-                let relative = path.strip_prefix(&folder).unwrap_or(&path);
-                if relative.as_os_str().is_empty() {
-                    continue;
-                }
-                // Canonical iCloud paths always start with '/'. Without this,
-                // watcher events create DB rows like "Alibaba" instead of
-                // "/Alibaba", which are then uploaded as bogus root items.
-                let relative =
-                    config::normalize_icloud_path(&relative.to_string_lossy().replace('\\', "/"));
-                if relative == "/" {
-                    continue;
-                }
-                if !watcher_inner.path_allowed(&relative) {
-                    continue;
-                }
-                let result = if path.exists() {
-                    if watcher_inner.is_ignorable_empty_ghost(&relative) {
-                        continue;
+            let mut batch: Vec<LocalAction> = Vec::new();
+            let settle = tokio::time::sleep(LOCAL_EVENT_SETTLE);
+            tokio::pin!(settle);
+            loop {
+                tokio::select! {
+                    incoming = rx.recv() => {
+                        let Some(action) = incoming else {
+                            watcher_inner.apply_local_actions(std::mem::take(&mut batch));
+                            break;
+                        };
+                        if watcher_inner.is_shutdown() {
+                            break;
+                        }
+                        batch.push(action);
+                        settle.as_mut().reset(tokio::time::Instant::now() + LOCAL_EVENT_SETTLE);
                     }
-                    watcher_inner.mark_local_change(&relative)
-                } else {
-                    watcher_inner.mark_local_delete(&relative)
-                };
-                if let Err(error) = result {
-                    debug!("ignoring local event for {relative}: {error}");
+                    _ = &mut settle => {
+                        if !batch.is_empty() {
+                            watcher_inner.apply_local_actions(std::mem::take(&mut batch));
+                        }
+                        settle.as_mut().reset(tokio::time::Instant::now() + LOCAL_EVENT_SETTLE);
+                    }
                 }
             }
         });
@@ -599,9 +768,82 @@ impl EngineInner {
         Ok(())
     }
 
+    /// Canonical `"/..."` iCloud path for a watched local path, or `None` when
+    /// the event is outside the sync folder, the root, or not allowed by config.
+    fn canonical_watch_path(&self, path: &Path) -> Option<String> {
+        let folder = self.cfg().sync_folder;
+        let relative = path.strip_prefix(&folder).ok()?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        let relative =
+            config::normalize_icloud_path(&relative.to_string_lossy().replace('\\', "/"));
+        if relative == "/" || !self.path_allowed(&relative) {
+            return None;
+        }
+        Some(relative)
+    }
+
+    fn is_hydrating(&self, relative: &str) -> bool {
+        self.hydrating.lock().unwrap().contains(relative)
+    }
+
+    fn apply_local_actions(&self, actions: Vec<LocalAction>) {
+        let actions = settle_actions(actions, |path| path.exists());
+        for action in actions {
+            match action {
+                LocalAction::Rename { from, to } => {
+                    let (Some(from_path), Some(to_path)) = (
+                        self.canonical_watch_path(&from),
+                        self.canonical_watch_path(&to),
+                    ) else {
+                        continue;
+                    };
+                    if self.is_hydrating(&from_path) || self.is_hydrating(&to_path) {
+                        continue;
+                    }
+                    if let Err(error) = self.mark_local_rename(&from_path, &to_path) {
+                        debug!("ignoring local rename {from_path} -> {to_path}: {error}");
+                    }
+                }
+                LocalAction::Change(path) => {
+                    let Some(relative) = self.canonical_watch_path(&path) else {
+                        continue;
+                    };
+                    if self.is_hydrating(&relative) || self.is_ignorable_empty_ghost(&relative) {
+                        continue;
+                    }
+                    if let Err(error) = self.mark_local_change(&relative) {
+                        debug!("ignoring local change for {relative}: {error}");
+                    }
+                }
+                LocalAction::Delete(path) => {
+                    let Some(relative) = self.canonical_watch_path(&path) else {
+                        continue;
+                    };
+                    if self.is_hydrating(&relative) {
+                        continue;
+                    }
+                    if let Err(error) = self.mark_local_delete(&relative) {
+                        debug!("ignoring local delete for {relative}: {error}");
+                    }
+                }
+                LocalAction::RenameFrom(_) | LocalAction::RenameTo(_) => {
+                    // Pairing happens in `settle_actions`.
+                }
+            }
+        }
+    }
+
     // -- remote crawl -----------------------------------------------------
 
     pub async fn sync_once(&self) -> Result<()> {
+        let result = self.sync_once_inner().await;
+        self.finish_sync(&result, "iCloud up to date");
+        result
+    }
+
+    async fn sync_once_inner(&self) -> Result<()> {
         if self.api.is_offline() {
             return Err(Error::Offline("cached files are read-only".into()));
         }
@@ -615,7 +857,6 @@ impl EngineInner {
         self.set_next_sync();
         self.state
             .sync_state_set("last_sync_at", &now.to_string())?;
-        self.publish(SyncState::Synced, "iCloud up to date");
         Ok(())
     }
 
@@ -637,6 +878,11 @@ impl EngineInner {
                 .collect(),
         };
         *self.remote_view.lock().unwrap() = Some(view.clone());
+        // Older builds dropped Apple's separate `extension` field, leaving
+        // rows/files named `bumpers` instead of `bumpers.pdf`. Repair them
+        // from remote metadata *before* purging, so local content is moved to
+        // the canonical path instead of being orphaned or duplicated.
+        repair_extensionless_paths(&self.state, &self.mirror, &snapshot)?;
         // Reconcile against the authoritative view before the watcher/upload
         // loops can see (and recreate) stale local or DB state.
         purge_stale_entries(&self.state, &self.mirror, &view)?;
@@ -668,8 +914,9 @@ impl EngineInner {
                         .is_some_and(|(old, new)| old != new)
                     || (!has_remote_id && at_path.is_some());
                 if conflict {
-                    warn!("conflict on {}; preserving local copy", entry.path);
-                    self.resolve_conflict(&entry.path)?;
+                    // No local conflict copies: the user wants their sync folder
+                    // to mirror iCloud cleanly. Remote metadata always wins.
+                    debug!("remote version wins on {}", entry.path);
                     self.materialize_remote_entry(path, node, crawl_started_at)
                         .await?;
                 } else {
@@ -851,32 +1098,6 @@ impl EngineInner {
         Ok(())
     }
 
-    /// Preserve a dirty local copy as `<name>.local-conflict-<stamp>` and detach
-    /// it from its remote identity so the upload loop recreates it.
-    fn resolve_conflict(&self, path: &str) -> Result<()> {
-        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
-        let target = conflict_path(path, &stamp);
-        let subtree = self.state.list_subtree(path)?;
-        if self.mirror.exists(path) {
-            self.mirror.rename(path, &target)?;
-        }
-        self.state.detach_subtree_as_conflict(path, &target)?;
-        for entry in subtree {
-            let suffix = if entry.path == path {
-                ""
-            } else {
-                &entry.path[path.len()..]
-            };
-            let new_path = if suffix.is_empty() {
-                target.clone()
-            } else {
-                format!("{target}{suffix}")
-            };
-            self.state.queue_op("conflict-copy", &new_path, None)?;
-        }
-        Ok(())
-    }
-
     fn schedule_all_unhydrated(&self) -> Result<()> {
         for entry in self.state.list_unhydrated()? {
             self.schedule_download(&entry.path);
@@ -919,6 +1140,17 @@ impl EngineInner {
     }
 
     async fn hydrate(&self, path: &str) {
+        self.hydrating.lock().unwrap().insert(path.to_string());
+        self.hydrate_inner(path).await;
+        self.hydrating.lock().unwrap().remove(path);
+        // A successful download is a completed operation: never leave a stale
+        // "Syncing" status behind if this was the last outstanding work.
+        if matches!(self.status().state, SyncState::Syncing) && self.pending_count() == 0 {
+            self.publish(SyncState::Synced, "file hydrated");
+        }
+    }
+
+    async fn hydrate_inner(&self, path: &str) {
         let entry = match self.state.get_entry(path) {
             Ok(Some(entry)) => entry,
             Ok(None) => return,
@@ -1084,9 +1316,17 @@ impl EngineInner {
     }
 
     fn mark_local_rename(&self, from: &str, to: &str) -> Result<()> {
-        self.state.rename_tree(from, to, false)?;
-        self.state.queue_op("rename", to, Some(from))?;
-        self.notify_local_change();
+        let from = config::normalize_icloud_path(from);
+        let to = config::normalize_icloud_path(to);
+        if self.state.get_entry(&from)?.is_some() {
+            self.state.rename_tree(&from, &to, false)?;
+            self.state.queue_op("rename", &to, Some(&from))?;
+            self.notify_local_change();
+        } else if self.state.get_entry(&to)?.is_none() {
+            // A brand-new local file renamed before its first upload has no
+            // row yet: treat the destination as a new file so it still syncs.
+            self.mark_local_change(&to)?;
+        }
         Ok(())
     }
 
@@ -1104,6 +1344,12 @@ impl EngineInner {
     }
 
     pub async fn sync_dirty(&self) -> Result<()> {
+        let result = self.sync_dirty_inner().await;
+        self.finish_sync(&result, "local changes uploaded");
+        result
+    }
+
+    async fn sync_dirty_inner(&self) -> Result<()> {
         if self.api.is_offline() {
             return Err(Error::Offline("local changes will sync later".into()));
         }
@@ -1138,6 +1384,48 @@ impl EngineInner {
                 self.state.mark_clean(&path, now, None)?;
             }
         }
+
+        let mut failures = 0usize;
+        // A pure local rename of an already-synced item leaves the row clean,
+        // so it lives only in pending_ops. Handle it before the dirty list is
+        // consulted, otherwise the op would be pruned and never reach Apple.
+        let rename_ops: Vec<_> = self
+            .state
+            .list_pending_ops()?
+            .into_iter()
+            .filter(|op| op.op == "rename")
+            .collect();
+        for op in rename_ops {
+            let Some(entry) = self.state.get_entry(&op.path)? else {
+                self.state.delete_op(op.id)?;
+                continue;
+            };
+            if entry.dirty
+                || entry.tombstone
+                || entry.remote_drivewsid.is_none()
+                || entry.synced_path.as_deref() == Some(entry.path.as_str())
+            {
+                // Dirty entries are processed by sync_file/sync_directory below.
+                continue;
+            }
+            match self.sync_move_or_rename(&entry).await {
+                Ok(()) => {
+                    let now = chrono::Utc::now().timestamp();
+                    self.state
+                        .mark_clean(&entry.path, now, entry.local_sha256.as_deref())?;
+                    self.state.delete_op(op.id)?;
+                    if self.cfg().instant_sync {
+                        self.request_remote_sync();
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    let _ = self.state.bump_op_retry(op.id, &error.to_string());
+                    warn!("could not rename {}: {error}", entry.path);
+                }
+            }
+        }
+
         let mut dirty = self.state.list_dirty()?;
         // Hydration may leave dirty rows whose content already matches the
         // stored checksum. Re-uploading them is pointless and produced hundreds
@@ -1145,9 +1433,14 @@ impl EngineInner {
         let already_clean: Vec<String> = dirty
             .iter()
             .filter(|entry| {
-                !entry.tombstone
-                    && !entry.is_dir()
-                    && entry.remote_drivewsid.is_some()
+                if entry.tombstone || entry.is_dir() || entry.remote_drivewsid.is_none() {
+                    return false;
+                }
+                // A queued local-change op is proof the user edited the file:
+                // `mark_dirty` stores the NEW checksum, so comparing hashes
+                // alone would silently discard real edits (== "nothing syncs").
+                // Only self-generated hydration dirt without an op is skipped.
+                !self.state.has_local_change_op(&entry.path).unwrap_or(true)
                     && entry.local_sha256.is_some()
             })
             .filter(|entry| {
@@ -1192,6 +1485,7 @@ impl EngineInner {
             dirty.retain(|entry| !entry.path.contains(".local-conflict-"));
         }
         if dirty.is_empty() {
+            self.set_next_sync();
             return Ok(());
         }
         dirty.sort_by(|a, b| match (a.tombstone, b.tombstone) {
@@ -1243,10 +1537,23 @@ impl EngineInner {
                 Err(error) if error.is_auth() => {
                     return Err(Error::Auth("login required to upload changes".into()));
                 }
-                Err(error) => warn!("could not sync {}: {error}", entry.path),
+                Err(error) => {
+                    failures += 1;
+                    warn!("could not sync {}: {error}", entry.path);
+                    if let Ok(ops) = self.state.list_pending_ops() {
+                        for op in ops.iter().filter(|op| op.path == entry.path) {
+                            let _ = self.state.bump_op_retry(op.id, &error.to_string());
+                        }
+                    }
+                }
             }
         }
         self.set_next_sync();
+        if failures > 0 {
+            return Err(Error::other(format!(
+                "{failures} local change(s) could not be uploaded; will retry"
+            )));
+        }
         Ok(())
     }
 
@@ -1388,13 +1695,35 @@ impl EngineInner {
         if synced == entry.path {
             return Ok(());
         }
-        let etag = entry.remote_etag.as_deref().unwrap_or_default();
-        if parent_path(synced) != parent_path(&entry.path) {
+        let mut etag = entry.remote_etag.clone().unwrap_or_default();
+        let moved = parent_path(synced) != parent_path(&entry.path);
+        if moved {
             let destination = self.remote_id_for_path(&parent_path(&entry.path)).await?;
-            self.api.move_node(id, etag, &destination).await?;
-        } else {
+            self.api.move_node(id, &etag, &destination).await?;
+            // Python re-reads the node after a move: the etag changes and a
+            // simultaneous rename must use the fresh one.
+            let share = entry
+                .remote_shareid
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok());
+            if let Ok(node) = self.api.retrieve_node(id, share.as_ref()).await {
+                if let Some(fresh) = node.etag {
+                    etag = fresh;
+                }
+                self.state.update_remote_fields(
+                    &entry.path,
+                    None,
+                    node.docwsid.as_deref(),
+                    Some(&etag),
+                    node.zone.as_deref(),
+                )?;
+            }
+        }
+        // A move that also changes the basename needs both operations, exactly
+        // like the Python driver's `_sync_move_or_rename`.
+        if basename(synced) != basename(&entry.path) {
             self.api
-                .rename_node(id, etag, &basename(&entry.path))
+                .rename_node(id, &etag, &basename(&entry.path))
                 .await?;
         }
         self.state.update_synced_path(&entry.path)?;
@@ -1609,6 +1938,88 @@ impl EngineInner {
         *self.config.lock().unwrap() = new_config;
         Ok(report)
     }
+}
+
+/// Repair rows/files that an older build stored without Apple's separate
+/// `extension` field (e.g. `/Docs/bumpers` for remote `bumpers.pdf`).
+///
+/// Only nodes whose canonical name is exactly `<old name>.<extension>` in the
+/// same folder are considered, so unrelated local files and genuine renames
+/// are never touched. Local content is *moved* (never deleted): if both paths
+/// hold real content the canonical file wins and the other file is left in
+/// place rather than risking data loss.
+fn repair_extensionless_paths(
+    state: &Database,
+    mirror: &Mirror,
+    snapshot: &HashMap<String, RemoteNode>,
+) -> Result<usize> {
+    let entries = state.list_entries()?;
+    let mut repaired = 0usize;
+    for (canonical, node) in snapshot {
+        if node.is_dir() {
+            continue;
+        }
+        let Some(ext) = node.extension.as_deref().filter(|ext| !ext.is_empty()) else {
+            continue;
+        };
+        let Some(canonical_name) = canonical.rsplit('/').next() else {
+            continue;
+        };
+        let Some(plain_name) = canonical_name.strip_suffix(&format!(".{ext}")) else {
+            continue;
+        };
+        if plain_name.is_empty() {
+            continue;
+        }
+        let old_path = join_path(&parent_path(canonical), plain_name);
+        if old_path == *canonical {
+            continue;
+        }
+        let old_local = mirror.local_path(&old_path)?;
+        let new_local = mirror.local_path(canonical)?;
+        let file_size = |path: &std::path::Path| fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let old_entry = entries.iter().find(|entry| entry.path == old_path);
+
+        if let Some(old_entry) = old_entry.filter(|entry| !entry.tombstone)
+            && old_entry.remote_drivewsid.as_deref() == Some(node.drivewsid.as_str())
+        {
+            let canonical_entry = entries.iter().find(|entry| entry.path == *canonical);
+            if canonical_entry.is_some_and(|entry| {
+                entry.remote_drivewsid.as_deref() != Some(node.drivewsid.as_str())
+            }) {
+                // A different remote node legitimately owns the canonical path.
+                continue;
+            }
+            if old_local.is_file() {
+                let new_has_content = new_local.is_file() && file_size(&new_local) > 0;
+                if !new_has_content {
+                    mirror.rename(&old_path, canonical)?;
+                }
+            }
+            if canonical_entry.is_some() {
+                state.remove_subtree(&old_path)?;
+            } else {
+                state.rename_tree_preserving_state(&old_path, canonical)?;
+            }
+            repaired += 1;
+            continue;
+        }
+
+        // No stale row, but an extensionless local file with content may be
+        // left over from the same bug. Move it onto the canonical path before
+        // materialization creates a second copy.
+        if old_entry.is_none() && old_local.is_file() && file_size(&old_local) > 0 {
+            let new_has_content = new_local.is_file() && file_size(&new_local) > 0;
+            if !new_has_content {
+                mirror.rename(&old_path, canonical)?;
+                repaired += 1;
+            }
+        }
+    }
+    if repaired > 0 {
+        info!("repaired {repaired} extensionless paths from remote metadata");
+    }
+    Ok(repaired)
 }
 
 /// Walk the remote tree and build canonical paths in one place.
@@ -2517,6 +2928,343 @@ mod tests {
             .unwrap(),
             b"precious"
         );
+    }
+
+    async fn test_engine(dir: &TempDir) -> SyncEngine {
+        let mut config = Config::load_defaults();
+        config.credential_mode = crate::config::CredentialMode::Plain;
+        config.sync_folder = dir.path.join("sync");
+        config.cache_dir = dir.path.join("cache");
+        config.cookie_dir = dir.path.join("cookies");
+        config.auto_sync = false;
+        config.instant_sync = false;
+        let api = crate::api::test_api(
+            json!({"dsInfo": {}, "hsaTrustedBrowser": true}),
+            crate::api::SessionData {
+                session_token: Some("test-session".into()),
+                ..Default::default()
+            },
+            false,
+        );
+        SyncEngine::new_with_status_path(Arc::new(api), config, dir.path.join("status.json"))
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn watcher_maps_all_notify_event_kinds() {
+        use notify::event::EventAttributes;
+        let file = PathBuf::from("/sync/Docs/note.txt");
+        let event = |kind| Event {
+            kind,
+            paths: vec![file.clone()],
+            attrs: EventAttributes::new(),
+        };
+        assert_eq!(
+            action_from_event(&event(EventKind::Create(notify::event::CreateKind::File))),
+            Some(LocalAction::Change(file.clone()))
+        );
+        assert_eq!(
+            action_from_event(&event(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content
+            )))),
+            Some(LocalAction::Change(file.clone()))
+        );
+        assert_eq!(
+            action_from_event(&event(EventKind::Remove(notify::event::RemoveKind::File))),
+            Some(LocalAction::Delete(file.clone()))
+        );
+        assert_eq!(
+            action_from_event(&event(EventKind::Modify(ModifyKind::Name(
+                RenameMode::From
+            )))),
+            Some(LocalAction::RenameFrom(file.clone()))
+        );
+        assert_eq!(
+            action_from_event(&event(EventKind::Modify(ModifyKind::Name(RenameMode::To)))),
+            Some(LocalAction::RenameTo(file.clone()))
+        );
+        let both = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            paths: vec![file.clone(), PathBuf::from("/sync/Docs/new.txt")],
+            attrs: EventAttributes::new(),
+        };
+        assert_eq!(
+            action_from_event(&both),
+            Some(LocalAction::Rename {
+                from: file.clone(),
+                to: PathBuf::from("/sync/Docs/new.txt"),
+            })
+        );
+        assert_eq!(
+            action_from_event(&event(EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write
+            )))),
+            None
+        );
+    }
+
+    #[test]
+    fn settled_events_pair_renames_and_normalize_paths() {
+        let old = PathBuf::from("/sync/Docs/note.txt");
+        let new = PathBuf::from("/sync/Docs/note2.txt");
+        let paired = settle_actions(
+            vec![
+                LocalAction::RenameFrom(old.clone()),
+                LocalAction::RenameTo(new.clone()),
+            ],
+            |_| true,
+        );
+        assert_eq!(
+            paired,
+            vec![LocalAction::Rename {
+                from: old.clone(),
+                to: new.clone()
+            }]
+        );
+
+        // A create followed by a remove of the same path resolves by current
+        // filesystem state instead of queuing contradictory ops.
+        let resolved = settle_actions(
+            vec![
+                LocalAction::Change(old.clone()),
+                LocalAction::Delete(old.clone()),
+            ],
+            |_| false,
+        );
+        assert_eq!(resolved, vec![LocalAction::Delete(old.clone())]);
+
+        let actions = settle_actions(
+            vec![LocalAction::Change(PathBuf::from("/sync/Docs/new.txt"))],
+            |_| true,
+        );
+        let LocalAction::Change(path) = &actions[0] else {
+            panic!("expected a change");
+        };
+        assert_eq!(
+            config::normalize_icloud_path(
+                &path
+                    .strip_prefix("/sync")
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            ),
+            "/Docs/new.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_paths_are_mapped_to_canonical_icloud_paths() {
+        let dir = TempDir::new();
+        let engine = test_engine(&dir).await;
+        let root = engine.inner.cfg().sync_folder;
+        assert_eq!(
+            engine
+                .inner
+                .canonical_watch_path(&root.join("Docs").join("note.txt"))
+                .as_deref(),
+            Some("/Docs/note.txt")
+        );
+        assert_eq!(
+            engine.inner.canonical_watch_path(&root).as_deref(),
+            None,
+            "the watch root is not a node"
+        );
+        assert_eq!(
+            engine
+                .inner
+                .canonical_watch_path(Path::new("/somewhere/else/note.txt"))
+                .as_deref(),
+            None
+        );
+        assert!(is_internal_local_path(Path::new(
+            "/sync/Docs/.note.txt.8f2c.tmp"
+        )));
+    }
+
+    #[tokio::test]
+    async fn local_add_rename_and_delete_are_recorded_with_canonical_paths() {
+        let dir = TempDir::new();
+        let engine = test_engine(&dir).await;
+        engine
+            .inner
+            .mirror
+            .write_all("/Docs/new.txt", b"hello")
+            .unwrap();
+
+        engine.inner.mark_local_change("Docs/new.txt").unwrap();
+        let added = engine
+            .inner
+            .state
+            .get_entry("/Docs/new.txt")
+            .unwrap()
+            .unwrap();
+        assert!(added.dirty);
+        assert!(
+            engine
+                .inner
+                .state
+                .has_local_change_op("/Docs/new.txt")
+                .unwrap()
+        );
+
+        engine
+            .inner
+            .mark_local_rename("/Docs/new.txt", "/Docs/renamed.txt")
+            .unwrap();
+        assert!(
+            engine
+                .inner
+                .state
+                .get_entry("/Docs/new.txt")
+                .unwrap()
+                .is_none()
+        );
+        let renamed = engine
+            .inner
+            .state
+            .get_entry("/Docs/renamed.txt")
+            .unwrap()
+            .unwrap();
+        assert!(renamed.dirty);
+        assert!(
+            engine
+                .inner
+                .state
+                .has_local_change_op("/Docs/renamed.txt")
+                .unwrap()
+        );
+        assert!(
+            engine
+                .inner
+                .state
+                .list_pending_ops()
+                .unwrap()
+                .iter()
+                .any(|op| op.op == "rename"
+                    && op.path == "/Docs/renamed.txt"
+                    && op.target_path.as_deref() == Some("/Docs/new.txt"))
+        );
+
+        engine.inner.mark_local_delete("/Docs/renamed.txt").unwrap();
+        assert!(
+            engine
+                .inner
+                .state
+                .get_entry("/Docs/renamed.txt")
+                .unwrap()
+                .is_none()
+        );
+        // Deleting a local-only row removes its queued ops; pruning catches any
+        // leftovers so `pending` always reaches zero.
+        engine.inner.state.prune_pending_ops().unwrap();
+        assert_eq!(engine.inner.state.count_pending_ops().unwrap(), 0);
+    }
+
+    #[test]
+    fn repair_moves_extensionless_file_without_losing_content() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+        mirror.write_all("/Docs/bumpers", b"precious").unwrap();
+        let mut old = dir_entry("/Docs/bumpers", Some("FILE::id"), true);
+        old.entry_type = "file".into();
+        old.synced_path = Some("/Docs/bumpers".into());
+        db.upsert_entry(&old).unwrap();
+        db.queue_op("modify", "/Docs/bumpers", None).unwrap();
+        let snapshot: HashMap<String, RemoteNode> = [(
+            "/Docs/bumpers.pdf".to_string(),
+            RemoteNode::from_value(&json!({
+                "name": "bumpers", "extension": "pdf", "type": "file", "drivewsid": "FILE::id"
+            })),
+        )]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            repair_extensionless_paths(&db, &mirror, &snapshot).unwrap(),
+            1
+        );
+        assert!(db.get_entry("/Docs/bumpers").unwrap().is_none());
+        let fixed = db.get_entry("/Docs/bumpers.pdf").unwrap().unwrap();
+        assert_eq!(fixed.synced_path.as_deref(), Some("/Docs/bumpers.pdf"));
+        assert!(fixed.dirty); // a queued local edit must survive the repair
+        assert_eq!(
+            fs::read(mirror.local_path("/Docs/bumpers.pdf").unwrap()).unwrap(),
+            b"precious"
+        );
+        assert!(!mirror.exists("/Docs/bumpers"));
+
+        // A second repair is a no-op and never duplicates data.
+        assert_eq!(
+            repair_extensionless_paths(&db, &mirror, &snapshot).unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_uses_parent_docwsid_not_drivewsid() {
+        let dir = TempDir::new();
+        let engine = test_engine(&dir).await;
+        let mut docs = clean_dir("/Docs", "FOLDER::com.apple.CloudDocs::DOC-ID");
+        docs.remote_docwsid = Some("DOC-ID".into());
+        docs.remote_zone = Some(CLOUD_DOCS_ZONE.into());
+        engine.inner.state.upsert_entry(&docs).unwrap();
+        assert_eq!(
+            engine.inner.remote_doc_id_for_path("/Docs").unwrap(),
+            ("DOC-ID".to_string(), CLOUD_DOCS_ZONE.to_string())
+        );
+        assert_eq!(
+            engine.inner.remote_doc_id_for_path("/").unwrap(),
+            (ROOT_DOCWSID.to_string(), CLOUD_DOCS_ZONE.to_string())
+        );
+        let payload = crate::api::add_file_payload_for_test(
+            "DOC-ID",
+            "note.txt",
+            "DOCUMENT-ID",
+            1,
+            &json!({"fileChecksum": "c"}),
+        );
+        assert_eq!(payload["path"]["starting_document_id"], "DOC-ID");
+        assert_eq!(payload["path"]["path"], "note.txt");
+    }
+
+    #[tokio::test]
+    async fn sync_paths_never_leave_status_at_syncing() {
+        let dir = TempDir::new();
+        let engine = test_engine(&dir).await;
+        // No drivews URL: the crawl fails with Auth before any remote change.
+        assert!(engine.sync_once().await.is_err());
+        assert_ne!(engine.status().state, SyncState::Syncing);
+        assert_eq!(engine.status().state, SyncState::LoginRequired);
+
+        let dir2 = TempDir::new();
+        let unauth = crate::api::test_api(Value::Null, Default::default(), false);
+        let mut config = Config::load_defaults();
+        config.credential_mode = crate::config::CredentialMode::Plain;
+        config.sync_folder = dir2.path.join("sync");
+        config.cache_dir = dir2.path.join("cache");
+        config.cookie_dir = dir2.path.join("cookies");
+        let engine2 = SyncEngine::new_with_status_path(
+            Arc::new(unauth),
+            config,
+            dir2.path.join("status.json"),
+        )
+        .await
+        .unwrap();
+        assert!(engine2.sync_dirty().await.is_err());
+        assert_eq!(engine2.status().state, SyncState::LoginRequired);
+
+        engine.inner.report_error(&Error::Offline("down".into()));
+        assert_eq!(engine.status().state, SyncState::Offline);
+        engine.inner.report_error(&Error::other("broken"));
+        assert_eq!(engine.status().state, SyncState::Error);
+
+        // Hydration has its own finally-style reset too.
+        *engine.inner.status_cache.lock().unwrap() =
+            ServiceStatus::new(SyncState::Syncing, "hydrating");
+        engine.inner.hydrate("/Docs/no-such-file.txt").await;
+        assert_ne!(engine.status().state, SyncState::Syncing);
     }
 
     #[tokio::test]

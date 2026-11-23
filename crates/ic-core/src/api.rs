@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use base64::Engine;
 use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE};
@@ -50,6 +51,9 @@ pub struct SessionData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteNode {
     pub name: String,
+    /// The separate extension Apple returns for most Drive nodes. Kept so the
+    /// engine can repair extensionless rows created by older builds.
+    pub extension: Option<String>,
     pub node_type: String,
     pub drivewsid: String,
     pub docwsid: Option<String>,
@@ -63,28 +67,27 @@ pub struct RemoteNode {
 
 impl RemoteNode {
     pub fn from_value(value: &Value) -> Self {
-        let name = value
+        // Apple (and pyicloud's DriveNode.name) returns the base name in
+        // `name` and the type suffix in a separate `extension` key. Using only
+        // `name` produced extensionless local files such as `/Docs/bumpers`.
+        // Mirror the reference unconditionally: whenever `extension` is
+        // present, the canonical name is `<base>.<extension>`.
+        let extension = value
+            .get("extension")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let base = value
             .get("name")
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                value.get("extension").and_then(Value::as_str).map(|ext| {
-                    format!(
-                        "{}.{ext}",
-                        value
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                    )
-                })
-            })
-            .unwrap_or_else(|| {
-                value
-                    .get("drivewsid")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unknown>")
-                    .to_string()
-            });
+            .filter(|name| !name.is_empty())
+            .or_else(|| value.get("drivewsid").and_then(Value::as_str))
+            .unwrap_or("<unknown>");
+        let name = match extension.as_deref() {
+            Some(ext) if !ext.is_empty() && !base.ends_with(&format!(".{ext}")) => {
+                format!("{base}.{ext}")
+            }
+            _ => base.to_string(),
+        };
         let node_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -96,6 +99,7 @@ impl RemoteNode {
             .map(|items| items.iter().map(Self::from_value).collect());
         Self {
             name,
+            extension,
             node_type,
             drivewsid: value
                 .get("drivewsid")
@@ -194,9 +198,13 @@ pub struct ICloudApi {
 
 impl ICloudApi {
     pub async fn new(config: &Config) -> Result<Self> {
+        // Never let a hung Apple request pin the engine in `Syncing`: the
+        // remote/upload loops must be able to report an error and retry.
         let client = ClientBuilder::new()
             .user_agent(USER_AGENT)
             .default_headers(default_request_headers())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()?;
         if config.credential_mode.is_secure() {
             config::require_secure_storage()?;
@@ -777,7 +785,7 @@ impl ICloudApi {
             .unwrap_or_default();
         let response = self
             .with_cookies(self.client.post(url).query(&self.params()))
-            .json(&json!({"items": [{"drivewsid": id, "etag": etag, "clientId": client_id}]}))
+            .json(&delete_payload(id, etag, &client_id))
             .send()
             .await?;
         self.checked(response).await?;
@@ -788,7 +796,7 @@ impl ICloudApi {
         let url = format!("{}/renameItems", self.webservice_url("drivews")?);
         let response = self
             .with_cookies(self.client.post(url).query(&self.params()))
-            .json(&json!({"items": [{"drivewsid": id, "etag": etag, "name": name}]}))
+            .json(&rename_payload(id, etag, name))
             .send()
             .await?;
         self.checked(response).await?;
@@ -796,13 +804,12 @@ impl ICloudApi {
     }
 
     pub async fn move_node(&self, id: &str, etag: &str, destination: &str) -> Result<()> {
-        let url = format!("{}/moveNodesToNode", self.webservice_url("drivews")?);
+        // pyicloud's DriveService.move_nodes_to_node posts to `/moveItems`
+        // with clientId == drivewsid (not `/moveNodesToNode`).
+        let url = format!("{}/moveItems", self.webservice_url("drivews")?);
         let response = self
             .with_cookies(self.client.post(url).query(&self.params()))
-            .json(&json!({
-                "destinationDrivewsId": destination,
-                "items": [{"drivewsid": id, "etag": etag, "clientId": id}],
-            }))
+            .json(&move_payload(destination, id, etag))
             .send()
             .await?;
         self.checked(response).await?;
@@ -890,6 +897,24 @@ impl ICloudApi {
             .await?;
         Ok(self.checked(response).await?.json().await?)
     }
+}
+
+/// `POST /deleteItems` body, mirroring pyicloud `DriveService.delete_items`.
+fn delete_payload(id: &str, etag: &str, client_id: &str) -> Value {
+    json!({"items": [{"drivewsid": id, "etag": etag, "clientId": client_id}]})
+}
+
+/// `POST /renameItems` body, mirroring pyicloud `DriveService.rename_items`.
+fn rename_payload(id: &str, etag: &str, name: &str) -> Value {
+    json!({"items": [{"drivewsid": id, "etag": etag, "name": name}]})
+}
+
+/// `POST /moveItems` body. Python uses the node id as `clientId` for moves.
+fn move_payload(destination: &str, id: &str, etag: &str) -> Value {
+    json!({
+        "destinationDrivewsId": destination,
+        "items": [{"drivewsid": id, "etag": etag, "clientId": id}],
+    })
 }
 
 /// Build the exact multipart body Python sends for a content-WS upload:
@@ -1185,6 +1210,19 @@ pub fn unb64(value: &str) -> Result<Vec<u8>> {
         .map_err(|error| Error::other(format!("invalid base64: {error}")))
 }
 
+/// Exposes the content-WS payload builder to engine tests that verify the
+/// parent document id used for uploads.
+#[cfg(test)]
+pub(crate) fn add_file_payload_for_test(
+    parent_doc_id: &str,
+    name: &str,
+    document_id: &str,
+    mtime: i64,
+    file_info: &Value,
+) -> Value {
+    add_file_payload(parent_doc_id, name, document_id, mtime, file_info)
+}
+
 /// In-memory API used only by state-transition tests; never touches the
 /// network or the user's credential files.
 #[cfg(test)]
@@ -1274,6 +1312,48 @@ mod tests {
     }
 
     #[test]
+    fn remote_node_composes_extension_like_pyicloud() {
+        let node = RemoteNode::from_value(&json!({
+            "name": "bumpers",
+            "extension": "pdf",
+            "type": "file",
+            "drivewsid": "FILE::id",
+        }));
+        assert_eq!(node.name, "bumpers.pdf");
+        assert_eq!(node.extension.as_deref(), Some("pdf"));
+        assert_eq!(node.display_name(), "bumpers.pdf");
+
+        // An empty name falls back to the id, then still gets the extension.
+        let node = RemoteNode::from_value(&json!({
+            "name": "",
+            "extension": "txt",
+            "drivewsid": "FILE::fallback",
+        }));
+        assert_eq!(node.name, "FILE::fallback.txt");
+
+        // Nested nodes are composed too (the crawl uses items recursively).
+        let parent = RemoteNode::from_value(&json!({
+            "name": "Docs",
+            "type": "folder",
+            "drivewsid": "FOLDER::docs",
+            "items": [{"name": "Scanned Document", "extension": "pdf", "type": "file"}],
+        }));
+        assert_eq!(
+            parent.items.as_ref().unwrap()[0].name,
+            "Scanned Document.pdf"
+        );
+
+        // No extension key: the bare name is preserved.
+        let node = RemoteNode::from_value(&json!({"name": "Folder", "type": "folder"}));
+        assert_eq!(node.name, "Folder");
+        assert_eq!(node.extension, None);
+
+        // Already-qualified names are not doubled.
+        let node = RemoteNode::from_value(&json!({"name": "note.txt", "extension": "txt"}));
+        assert_eq!(node.name, "note.txt");
+    }
+
+    #[test]
     fn remote_node_display_name_is_a_single_component() {
         let node = RemoteNode::from_value(&json!({
             "name": "Instagram",
@@ -1316,6 +1396,28 @@ mod tests {
         assert_eq!(node.display_name(), ROOT_DRIVEWSID);
         assert_eq!(safe_node_name("///"), None);
         assert_eq!(safe_node_name(".."), None);
+    }
+
+    #[test]
+    fn rename_delete_move_payloads_match_python_drivews_calls() {
+        let delete = delete_payload("FILE::42", "etag-1", "client-9");
+        assert_eq!(
+            delete,
+            json!({"items": [{"drivewsid": "FILE::42", "etag": "etag-1", "clientId": "client-9"}]})
+        );
+        let rename = rename_payload("FILE::42", "etag-1", "renamed.txt");
+        assert_eq!(
+            rename,
+            json!({"items": [{"drivewsid": "FILE::42", "etag": "etag-1", "name": "renamed.txt"}]})
+        );
+        let moved = move_payload("FOLDER::dest", "FILE::42", "etag-1");
+        assert_eq!(
+            moved,
+            json!({
+                "destinationDrivewsId": "FOLDER::dest",
+                "items": [{"drivewsid": "FILE::42", "etag": "etag-1", "clientId": "FILE::42"}],
+            })
+        );
     }
 
     #[test]

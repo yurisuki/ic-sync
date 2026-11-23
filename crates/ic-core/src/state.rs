@@ -222,6 +222,35 @@ impl Database {
         Ok(())
     }
 
+    /// True when a queued operation records a real local edit (create/modify/
+    /// rename/delete). Hydration writes never queue such an operation, so this
+    /// distinguishes user changes from self-generated write events.
+    pub fn has_local_change_op(&self, path: &str) -> Result<bool> {
+        let conn = self.connection.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM pending_ops WHERE \
+                 op IN ('create','modify','rename','delete','move','mkdir') \
+                 AND (path=?1 OR target_path=?1)",
+            params![path],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    }
+
+    /// Drop queued operations that no longer have a dirty/tombstone entry at
+    /// either end. Successful syncs mark entries clean (which already deletes
+    /// matching ops); this catches leftovers from renames, purged rows and
+    /// failed "create parent" attempts so `pending` always drains to zero.
+    pub fn prune_pending_ops(&self) -> Result<usize> {
+        let conn = self.connection.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM pending_ops WHERE \
+             (path NOT IN (SELECT path FROM entries WHERE dirty=1 OR tombstone=1)) \
+             AND (target_path IS NULL OR target_path NOT IN \
+                  (SELECT path FROM entries WHERE dirty=1 OR tombstone=1))",
+            [],
+        )?)
+    }
+
     pub fn bump_op_retry(&self, id: i64, error: &str) -> Result<()> {
         let conn = self.connection.lock().unwrap();
         conn.execute(
@@ -601,6 +630,72 @@ impl Database {
         }
         Ok(())
     }
+
+    /// Rename a subtree while keeping local-change flags intact. Used when an
+    /// older build stored a node under its bare name and the next crawl learns
+    /// the canonical `name.extension`: the local content moves with the row,
+    /// and a queued upload must not be discarded by the path repair.
+    pub fn rename_tree_preserving_state(&self, from: &str, to: &str) -> Result<()> {
+        let conn = self.connection.lock().unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT path, parent_path FROM entries WHERE path=?1 OR path LIKE ?2")?
+            .query_map(params![from, format!("{from}/%")], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let prefix = format!("{}/", from.trim_end_matches('/'));
+        for (old_path, old_parent) in rows {
+            let suffix = if old_path == from {
+                ""
+            } else {
+                &old_path[prefix.len()..]
+            };
+            let new_path = if suffix.is_empty() {
+                to.to_string()
+            } else {
+                format!("{}/{}", to.trim_end_matches('/'), suffix)
+            };
+            let new_parent = if old_path == from {
+                parent_path(to)
+            } else {
+                let parent_suffix = &old_parent[prefix.len().saturating_sub(1)..];
+                format!("{}{}", to.trim_end_matches('/'), parent_suffix)
+            };
+            conn.execute(
+                "UPDATE entries SET path=?2, parent_path=?3, synced_path=CASE \
+                     WHEN synced_path=?1 THEN ?2 \
+                     WHEN synced_path LIKE ?4 THEN ?5 || substr(synced_path, ?6) \
+                     ELSE synced_path END WHERE path=?1",
+                params![
+                    old_path,
+                    new_path,
+                    new_parent,
+                    format!("{prefix}%"),
+                    format!("{}/", to.trim_end_matches('/')),
+                    (prefix.len() + 1) as i64,
+                ],
+            )?;
+            conn.execute(
+                "UPDATE pending_ops SET path=CASE \
+                     WHEN path=?1 THEN ?2 \
+                     WHEN path LIKE ?3 THEN ?4 || substr(path, ?5) \
+                     ELSE path END, \
+                  target_path=CASE \
+                     WHEN target_path=?1 THEN ?2 \
+                     WHEN target_path LIKE ?3 THEN ?4 || substr(target_path, ?5) \
+                     ELSE target_path END \
+                  WHERE path=?1 OR path LIKE ?3 OR target_path=?1 OR target_path LIKE ?3",
+                params![
+                    old_path,
+                    new_path,
+                    format!("{prefix}%"),
+                    format!("{}/", to.trim_end_matches('/')),
+                    (prefix.len() + 1) as i64,
+                ],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 pub fn parent_path(path: &str) -> String {
@@ -718,6 +813,49 @@ mod tests {
             .unwrap();
         assert!(child.remote_drivewsid.is_none());
         assert!(child.dirty);
+    }
+
+    #[test]
+    fn local_change_ops_and_pruning() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        db.upsert_entry(&entry("/dirty.txt", "file", Some("id")))
+            .unwrap();
+        db.upsert_entry(&entry("/clean.txt", "file", Some("id2")))
+            .unwrap();
+        db.mark_clean("/clean.txt", 1, None).unwrap();
+        assert!(!db.has_local_change_op("/dirty.txt").unwrap());
+        db.queue_op("modify", "/dirty.txt", None).unwrap();
+        assert!(db.has_local_change_op("/dirty.txt").unwrap());
+        // Orphan ops (no dirty/tombstone entry at either end) are drained.
+        db.queue_op("create", "/ghost.txt", None).unwrap();
+        db.queue_op("rename", "/dirty.txt", Some("/clean.txt"))
+            .unwrap();
+        assert_eq!(db.prune_pending_ops().unwrap(), 1);
+        let ops = db.list_pending_ops().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(
+            ops.iter().all(
+                |op| op.path == "/dirty.txt" || op.target_path.as_deref() == Some("/dirty.txt")
+            )
+        );
+    }
+
+    #[test]
+    fn rename_tree_preserves_dirty_flags() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        db.upsert_entry(&entry("/bumpers", "file", Some("id")))
+            .unwrap();
+        db.queue_op("modify", "/bumpers", None).unwrap();
+        db.rename_tree_preserving_state("/bumpers", "/bumpers.pdf")
+            .unwrap();
+        let renamed = db.get_entry("/bumpers.pdf").unwrap().unwrap();
+        assert!(renamed.dirty);
+        assert_eq!(renamed.synced_path.as_deref(), Some("/bumpers.pdf"));
+        let ops = db.list_pending_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].path, "/bumpers.pdf");
     }
 
     #[test]
