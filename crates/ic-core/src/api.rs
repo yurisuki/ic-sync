@@ -8,25 +8,30 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use base64::Engine;
-use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
+use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE};
 use reqwest::{Client, ClientBuilder, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::bridge::BridgeSession;
 use crate::config::{self, Config, SecretKind, atomic_write, credential_key};
 use crate::error::{Error, Result};
 
 pub const ROOT_DRIVEWSID: &str = "FOLDER::com.apple.CloudDocs::root";
+/// The root folder's document id (the part after the final `::` in
+/// `ROOT_DRIVEWSID`). Apple's `/update/documents` API chains children by
+/// *docwsid*, never by drivewsid.
+pub const ROOT_DOCWSID: &str = "root";
 pub const CLOUD_DOCS_ZONE: &str = "com.apple.CloudDocs";
 const CLIENT_BUILD_NUMBER: &str = "2534Project66";
 const CLIENT_MASTERING_NUMBER: &str = "2534B22";
 const OAUTH_CLIENT_ID: &str = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -136,6 +141,32 @@ impl RemoteNode {
     pub fn is_dir(&self) -> bool {
         matches!(self.node_type.as_str(), "folder" | "app_library")
     }
+
+    /// One safe path component for this node, never a path fragment.
+    ///
+    /// Apple sometimes returns a bare `name` that is actually a path
+    /// (`Parent/Child`), starts with a slash, or (for some app libraries) is
+    /// the raw `drivewsid` such as `FOLDER::com.apple.TextInput::documents`.
+    /// Joining any of those onto a parent path produces the doubled paths
+    /// (`/Parent/Parent`, `/Parent/Full::Path::Name`) seen after a bad crawl.
+    pub fn display_name(&self) -> String {
+        safe_node_name(&self.name)
+            .or_else(|| safe_node_name(&self.drivewsid))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+/// Collapse a remote name to a single path component.
+///
+/// Returns `None` for empty, `.`, `..` or separator-only names. Both slashes
+/// and backslashes are treated as separators so a remote name can never
+/// inject extra path levels (or escape the mirror on Windows).
+pub fn safe_node_name(raw: &str) -> Option<String> {
+    let part = raw
+        .trim()
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty() && *component != "." && *component != "..")?;
+    Some(part.to_string())
 }
 
 #[derive(Clone)]
@@ -150,6 +181,10 @@ pub struct ICloudApi {
     pub setup_endpoint: String,
     pub home_endpoint: String,
     pub mfa_pending: Arc<RwLock<bool>>,
+    /// The live HSA2 trusted-device bridge, kept alive between `authenticate()`
+    /// and `submit_code()`. The transport is owned by core; the GUI never has
+    /// to manage it.
+    bridge: Arc<Mutex<Option<BridgeSession>>>,
     offline: Arc<RwLock<Option<String>>>,
     credential_key: String,
     /// Secure mode mirrors tokens into the OS keyring; plain mode keeps them
@@ -159,7 +194,10 @@ pub struct ICloudApi {
 
 impl ICloudApi {
     pub async fn new(config: &Config) -> Result<Self> {
-        let client = ClientBuilder::new().user_agent(USER_AGENT).build()?;
+        let client = ClientBuilder::new()
+            .user_agent(USER_AGENT)
+            .default_headers(default_request_headers())
+            .build()?;
         if config.credential_mode.is_secure() {
             config::require_secure_storage()?;
         }
@@ -218,6 +256,7 @@ impl ICloudApi {
             setup_endpoint,
             home_endpoint: "https://www.icloud.com".into(),
             mfa_pending: Arc::new(RwLock::new(false)),
+            bridge: Arc::new(Mutex::new(None)),
             offline: Arc::new(RwLock::new(probe_error)),
             credential_key: key,
             credential_mode: config.credential_mode,
@@ -254,6 +293,23 @@ impl ICloudApi {
 
     pub fn session_token(&self) -> Option<String> {
         self.session.read().unwrap().session_token.clone()
+    }
+
+    /// Store the bridge session created by `authenticate()` for later code
+    /// validation. Any previous (stale) session is replaced.
+    pub fn set_bridge_session(&self, session: BridgeSession) {
+        *self.bridge.lock().unwrap() = Some(session);
+    }
+
+    /// Take the bridge session out of storage so code validation can use it
+    /// without holding a lock across network I/O.
+    pub fn take_bridge_session(&self) -> Option<BridgeSession> {
+        self.bridge.lock().unwrap().take()
+    }
+
+    /// Discard any live bridge transport.
+    pub fn clear_bridge_session(&self) {
+        *self.bridge.lock().unwrap() = None;
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -385,20 +441,22 @@ impl ICloudApi {
         }
     }
 
-    pub fn capture(&self, response: &Response) {
+    /// Capture only cookies from a response. Bridge steps use raw HTTP in the
+    /// Python implementation: their headers must not overwrite Apple session
+    /// tokens, but refreshed auth cookies still need to be kept.
+    pub fn capture_cookies(&self, response: &Response) {
         let mut changed = false;
         {
             let mut jar = self.cookies.write().unwrap();
             for values in response.headers().get_all(SET_COOKIE).iter() {
                 let Ok(text) = values.to_str() else { continue };
                 if let Some((name, rest)) = text.split_once('=') {
-                    let value = rest
-                        .split(';')
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .trim_matches('"');
-                    if jar.get(name).map(String::as_str) != Some(value) {
+                    // Apple's auth cookie values carry literal surrounding
+                    // quotes. Python's http.cookiejar keeps them, and so must
+                    // we: stripping them corrupts the token (HTTP 421 on every
+                    // Drive call and a misleading "sign in required" status).
+                    let value = rest.split(';').next().unwrap_or_default().trim();
+                    if jar.get(name.trim()).map(String::as_str) != Some(value) {
                         jar.insert(name.trim().to_string(), value.to_string());
                         changed = true;
                     }
@@ -408,6 +466,10 @@ impl ICloudApi {
         if changed {
             let _ = self.persist();
         }
+    }
+
+    pub fn capture(&self, response: &Response) {
+        self.capture_cookies(response);
         update_session_from_headers(response, &self.session);
     }
 
@@ -428,7 +490,8 @@ impl ICloudApi {
         for name in names {
             lines.push(format!(
                 "Set-Cookie3: {}={}; path=\"/\"; domain=.icloud.com; path_spec; secure; discard; version=0",
-                name, jar[name]
+                name,
+                quote_cookie_value(&jar[name])
             ));
         }
         atomic_write(&self.cookie_path, (lines.join("\n") + "\n").as_bytes())?;
@@ -470,6 +533,7 @@ impl ICloudApi {
         self.cookies.write().unwrap().clear();
         *self.data.write().unwrap() = Value::Null;
         *self.mfa_pending.write().unwrap() = false;
+        self.clear_bridge_session();
         Ok(())
     }
 
@@ -505,6 +569,22 @@ impl ICloudApi {
         }
     }
 
+    /// Safe, value-free diagnostics for authentication failures.
+    pub fn auth_diagnostics(&self) -> String {
+        let session = self.session.read().unwrap();
+        let cookies = self.cookies.read().unwrap();
+        let mut names: Vec<&str> = cookies.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        format!(
+            "sessionTokenLen={} trustToken={} country={:?} cookies=[{}] setup={}",
+            session.session_token.as_ref().map_or(0, String::len),
+            session.trust_token.is_some(),
+            session.account_country.as_deref().unwrap_or(""),
+            names.join(", "),
+            self.setup_endpoint
+        )
+    }
+
     pub async fn login_with_token(&self) -> Result<()> {
         let (token, country, trust) = {
             let session = self.session.read().unwrap();
@@ -518,7 +598,9 @@ impl ICloudApi {
         let response = self
             .with_cookies(
                 self.client
-                    .post(format!("{}/accountLogin", self.setup_endpoint)),
+                    .post(format!("{}/accountLogin", self.setup_endpoint))
+                    .header("Origin", "https://www.icloud.com")
+                    .header("Referer", "https://www.icloud.com/"),
             )
             .json(&json!({
                 "accountCountryCode": country.unwrap_or_default(),
@@ -538,6 +620,7 @@ impl ICloudApi {
             *self.mfa_pending.write().unwrap() = true;
         }
         *self.data.write().unwrap() = data;
+        self.clear_bridge_session();
         if let Some(dsid) = self
             .data
             .read()
@@ -550,6 +633,10 @@ impl ICloudApi {
         }
         self.persist()?;
         if self.requires_2fa() {
+            // Keep the cached-session state explicit: an untrusted or still
+            // challenged session must look like "needs sign-in" to callers,
+            // never like a usable read/write session.
+            *self.mfa_pending.write().unwrap() = true;
             return Err(Error::TwoFactor("finish 2FA in IC-SYNC to continue".into()));
         }
         Ok(())
@@ -723,9 +810,16 @@ impl ICloudApi {
     }
 
     /// Upload a complete file to the iCloud Drive content service.
+    ///
+    /// `parent_doc_id` must be the parent folder's **docwsid** (not its
+    /// drivewsid): Apple chains the new document to its parent by document id
+    /// in `/update/documents`, and a drivewsid there yields HTTP 412
+    /// `VALIDATING_REFERENCE_ERROR` ("parents were missing"). `zone` is the
+    /// parent's zone; it is part of both document-service URL paths.
     pub async fn upload(
         &self,
-        folder_id: &str,
+        parent_doc_id: &str,
+        zone: &str,
         name: &str,
         content: Vec<u8>,
         mtime: i64,
@@ -746,7 +840,7 @@ impl ICloudApi {
         let response = self
             .with_cookies(
                 self.client
-                    .post(format!("{document_root}/ws/{CLOUD_DOCS_ZONE}/upload/web"))
+                    .post(format!("{document_root}/ws/{zone}/upload/web"))
                     .query(&params),
             )
             .header(CONTENT_TYPE, "text/plain")
@@ -774,41 +868,20 @@ impl ICloudApi {
             .ok_or_else(|| Error::other("upload response had no url"))?
             .to_string();
 
-        let part = reqwest::multipart::Part::bytes(content).file_name(name.to_string());
         let response = self
             .with_cookies(self.client.post(&upload_url))
-            .multipart(reqwest::multipart::Form::new().part(name.to_string(), part))
+            .multipart(upload_form(name, content))
             .send()
             .await?;
         let receipt: Value = self.checked(response).await?.json().await?;
         let file_info = receipt
             .get("singleFile")
             .ok_or_else(|| Error::other("upload receipt had no singleFile"))?;
-        let mut data = json!({
-            "data": {
-                "signature": file_info.get("fileChecksum").cloned().unwrap_or(Value::Null),
-                "wrapping_key": file_info.get("wrappingKey").cloned().unwrap_or(Value::Null),
-                "reference_signature": file_info.get("referenceChecksum").cloned().unwrap_or(Value::Null),
-                "size": file_info.get("size").cloned().unwrap_or(Value::Null),
-            },
-            "command": "add_file",
-            "create_short_guid": true,
-            "document_id": document_id,
-            "path": {"starting_document_id": folder_id, "path": name},
-            "allow_conflict": true,
-            "file_flags": {"is_writable": true, "is_executable": false, "is_hidden": false},
-            "mtime": mtime * 1000,
-            "btime": mtime * 1000,
-        });
-        if let Some(receipt_value) = file_info.get("receipt") {
-            data["data"]["receipt"] = receipt_value.clone();
-        }
+        let data = add_file_payload(parent_doc_id, name, &document_id, mtime, file_info);
         let response = self
             .with_cookies(
                 self.client
-                    .post(format!(
-                        "{document_root}/ws/{CLOUD_DOCS_ZONE}/update/documents"
-                    ))
+                    .post(format!("{document_root}/ws/{zone}/update/documents"))
                     .query(&self.params()),
             )
             .header(CONTENT_TYPE, "text/plain")
@@ -819,8 +892,111 @@ impl ICloudApi {
     }
 }
 
+/// Build the exact multipart body Python sends for a content-WS upload:
+/// a single field named after the file, with the filename set to the same
+/// value and no per-part `Content-Type` (urllib3 omits it when requests is
+/// given `files={name: file_object}`).
+fn upload_form(name: &str, content: Vec<u8>) -> reqwest::multipart::Form {
+    let part = reqwest::multipart::Part::bytes(content).file_name(name.to_string());
+    reqwest::multipart::Form::new().part(name.to_string(), part)
+}
+
+/// Mirror of pyicloud's `DriveService._update_contentws`: the new document is
+/// chained to its parent by **docwsid**, and `path.path` is the basename.
+fn add_file_payload(
+    parent_doc_id: &str,
+    name: &str,
+    document_id: &str,
+    mtime: i64,
+    file_info: &Value,
+) -> Value {
+    let mut data = json!({
+        "data": {
+            "signature": file_info.get("fileChecksum").cloned().unwrap_or(Value::Null),
+            "wrapping_key": file_info.get("wrappingKey").cloned().unwrap_or(Value::Null),
+            "reference_signature": file_info.get("referenceChecksum").cloned().unwrap_or(Value::Null),
+            "size": file_info.get("size").cloned().unwrap_or(Value::Null),
+        },
+        "command": "add_file",
+        "create_short_guid": true,
+        "document_id": document_id,
+        "path": {
+            "starting_document_id": parent_doc_id,
+            "path": file_basename(name),
+        },
+        "allow_conflict": true,
+        "file_flags": {"is_writable": true, "is_executable": false, "is_hidden": false},
+        "mtime": mtime * 1000,
+        "btime": mtime * 1000,
+    });
+    // Absent for zero-byte files; Python only adds the key when truthy.
+    if let Some(receipt) = file_info.get("receipt")
+        && json_is_truthy(receipt)
+    {
+        data["data"]["receipt"] = receipt.clone();
+    }
+    data
+}
+
+/// Identity returned by `/update/documents` after a successful add.
+#[derive(Debug, Clone)]
+pub struct UploadedDocument {
+    pub docwsid: String,
+    pub etag: Option<String>,
+    pub zone: Option<String>,
+}
+
+/// `POST /update/documents` answers with
+/// `{"results":[{"document":{"document_id":…,"etag":…,"zone":…}}],"status":…}`.
+/// It has no top-level `drivewsid`, so callers must read the nested document
+/// (or refresh the parent's children like the Python reference does).
+pub fn uploaded_document(response: &Value) -> Option<UploadedDocument> {
+    let document = response.get("results")?.get(0)?.get("document")?;
+    let docwsid = document.get("document_id")?.as_str()?.to_string();
+    Some(UploadedDocument {
+        docwsid,
+        etag: document
+            .get("etag")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        zone: document
+            .get("zone")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Python truthiness for JSON values, used for the optional upload receipt.
+fn json_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::Number(number) => number.as_f64().is_none_or(|number| number != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(true) => true,
+    }
+}
+
+/// Python uses `os.path.basename(file_object.name)` for the path component.
+/// The watcher already passes a basename; applying it here too keeps the
+/// payload correct when callers pass a fuller name.
+fn file_basename(name: &str) -> &str {
+    name.rsplit(['/', '\\']).next().unwrap_or(name)
+}
+
 fn paths_secure_dir(path: &std::path::Path) -> Result<()> {
     crate::paths::create_secure_dir(path)
+}
+
+/// Python sends Origin/Referer on every request through its session defaults.
+/// Apple's Drive endpoints answer HTTP 421 without them, which our status
+/// bridge reports as "sign in required" even for a valid, trusted session.
+fn default_request_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(ORIGIN, "https://www.icloud.com".parse().unwrap());
+    headers.insert(REFERER, "https://www.icloud.com/".parse().unwrap());
+    headers
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
@@ -889,24 +1065,82 @@ fn read_session_file(path: &std::path::Path) -> Result<SessionData> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+/// Decode a value from an LWP (`Set-Cookie3:`) cookie file. Apple's web-auth
+/// cookies carry literal leading/trailing quotes as part of the value, which
+/// LWP stores as `name="\"value\""`. Only the outer quotes are syntax; the
+/// escaped inner quotes belong to the token. Stripping those literal quotes
+/// (as older IC-SYNC releases did) corrupts the cookie and Apple answers every
+/// Drive call with HTTP 421, which looks like an expired login.
+fn unquote_cookie_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let body = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(chars.next().unwrap_or('\\'));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// LWP-escaped form of a cookie value, so the value round-trips through both
+/// our reader and Python's `LWPCookieJar` exactly.
+fn quote_cookie_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+fn is_apple_auth_cookie(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("X-APPLE-") || upper.starts_with("X_APPLE_WEB_KB-")
+}
+
 fn read_cookie_file(path: &std::path::Path) -> Result<HashMap<String, String>> {
+    let raw = fs::read_to_string(path)?;
+    let lines: Vec<_> = raw
+        .lines()
+        .filter(|line| line.starts_with("Set-Cookie3: "))
+        .collect();
+    // Compatibility for cookie files written by older IC-SYNC builds: they
+    // used one fixed attribute suffix for every cookie and stripped the
+    // literal quotes from Apple's auth cookie values. Only that exact shape is
+    // repaired, so a correctly written file is never rewritten heuristically.
+    let legacy = !lines.is_empty()
+        && lines
+            .iter()
+            .all(|line| line.contains("domain=.icloud.com; path_spec; secure; discard; version=0"));
     let mut jar = HashMap::new();
-    for line in fs::read_to_string(path)?.lines() {
-        let Some(rest) = line.strip_prefix("Set-Cookie3: ") else {
+    for line in lines {
+        let Some((name, value)) = line.trim_start_matches("Set-Cookie3: ").split_once('=') else {
             continue;
         };
-        if let Some((name, value)) = rest.split_once('=') {
-            jar.insert(
-                name.trim().to_string(),
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .trim_matches('"')
-                    .to_string(),
-            );
-        }
+        let name = name.trim();
+        let value = unquote_cookie_value(value.split(';').next().unwrap_or_default());
+        let value = if legacy
+            && is_apple_auth_cookie(name)
+            && !(value.starts_with('"') && value.ends_with('"'))
+        {
+            // The quotes were part of the original token; restore them.
+            format!("\"{value}\"")
+        } else {
+            value
+        };
+        jar.insert(name.to_string(), value);
     }
     Ok(jar)
 }
@@ -949,4 +1183,239 @@ pub fn unb64(value: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|error| Error::other(format!("invalid base64: {error}")))
+}
+
+/// In-memory API used only by state-transition tests; never touches the
+/// network or the user's credential files.
+#[cfg(test)]
+pub(crate) fn test_api(data: Value, session: SessionData, mfa_pending: bool) -> ICloudApi {
+    ICloudApi {
+        client: Client::new(),
+        session: Arc::new(RwLock::new(session)),
+        data: Arc::new(RwLock::new(data)),
+        cookies: Arc::new(RwLock::new(HashMap::new())),
+        cookie_path: PathBuf::from("/tmp/ic-core-test.cookiejar"),
+        session_path: PathBuf::from("/tmp/ic-core-test.session"),
+        auth_endpoint: "https://idmsa.apple.com/appleauth/auth".into(),
+        setup_endpoint: "https://setup.icloud.com/setup/ws/1".into(),
+        home_endpoint: "https://www.icloud.com".into(),
+        mfa_pending: Arc::new(RwLock::new(mfa_pending)),
+        bridge: Arc::new(Mutex::new(None)),
+        offline: Arc::new(RwLock::new(None)),
+        credential_key: "ic-core-test".into(),
+        credential_mode: config::CredentialMode::Plain,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    #[test]
+    fn apple_cookie_quotes_survive_lwp_round_trip() {
+        // Python's jar stores the outer quotes as part of the token value.
+        let value = "\"eyJhbGciOi...\"";
+        let encoded = quote_cookie_value(value);
+        assert_eq!(encoded, "\"\\\"eyJhbGciOi...\\\"\"");
+        assert_eq!(unquote_cookie_value(&encoded), value);
+    }
+
+    #[test]
+    fn lwp_cookie_file_keeps_apple_auth_cookie_quotes() {
+        let dir = TempDir::new();
+        let path = dir.path.join("cookies");
+        fs::write(
+            &path,
+            "#LWP-Cookies-2.0\n\
+             Set-Cookie3: X-APPLE-WEBAUTH-TOKEN=\"\\\"token\\\"\"; path=\"/\"; \
+             domain=.icloud.com; path_spec; domain_dot; secure; \
+             expires=\"2027-01-01 00:00:00Z\"; version=0\n",
+        )
+        .unwrap();
+        let jar = read_cookie_file(&path).unwrap();
+        assert_eq!(
+            jar.get("X-APPLE-WEBAUTH-TOKEN").map(String::as_str),
+            Some("\"token\"")
+        );
+    }
+
+    #[test]
+    fn legacy_cookie_file_is_repaired_on_load() {
+        let dir = TempDir::new();
+        let path = dir.path.join("cookies");
+        // Exact shape written by older IC-SYNC releases: one attribute suffix
+        // for every cookie and the literal token quotes already stripped.
+        fs::write(
+            &path,
+            "#LWP-Cookies-2.0\n\
+             Set-Cookie3: X-APPLE-WEBAUTH-TOKEN=token; path=\"/\"; \
+             domain=.icloud.com; path_spec; secure; discard; version=0\n\
+             Set-Cookie3: site=abc; path=\"/\"; \
+             domain=.icloud.com; path_spec; secure; discard; version=0\n",
+        )
+        .unwrap();
+        let jar = read_cookie_file(&path).unwrap();
+        assert_eq!(
+            jar.get("X-APPLE-WEBAUTH-TOKEN").map(String::as_str),
+            Some("\"token\"")
+        );
+        assert_eq!(jar.get("site").map(String::as_str), Some("abc"));
+        // The repaired jar must round-trip to a valid LWP file.
+        let encoded = quote_cookie_value(jar.get("X-APPLE-WEBAUTH-TOKEN").unwrap());
+        assert_eq!(encoded, "\"\\\"token\\\"\"");
+    }
+
+    #[test]
+    fn default_request_headers_match_python_session() {
+        let headers = default_request_headers();
+        assert_eq!(headers.get(ORIGIN).unwrap(), "https://www.icloud.com");
+        assert_eq!(headers.get(REFERER).unwrap(), "https://www.icloud.com/");
+    }
+
+    #[test]
+    fn remote_node_display_name_is_a_single_component() {
+        let node = RemoteNode::from_value(&json!({
+            "name": "Instagram",
+            "type": "app_library",
+            "drivewsid": "FOLDER::iCloud.com.burbn.instagram::documents",
+        }));
+        assert_eq!(node.display_name(), "Instagram");
+
+        // Apple returns some app-library names as a full drivewsid.
+        let node = RemoteNode::from_value(&json!({
+            "name": "FOLDER::com.apple.TextInput::documents",
+            "type": "app_library",
+            "drivewsid": "FOLDER::com.apple.TextInput::documents",
+        }));
+        assert_eq!(
+            node.display_name(),
+            "FOLDER::com.apple.TextInput::documents"
+        );
+
+        // A name that smuggles in a parent path is reduced to its basename.
+        let node = RemoteNode::from_value(&json!({
+            "name": "/Parent/Child",
+            "type": "folder",
+            "drivewsid": "FOLDER::child",
+        }));
+        assert_eq!(node.display_name(), "Child");
+        let node = RemoteNode::from_value(&json!({
+            "name": "Parent\\Child",
+            "type": "folder",
+            "drivewsid": "FOLDER::child",
+        }));
+        assert_eq!(node.display_name(), "Child");
+
+        // The root node has an empty name; fall back to its id, still one level.
+        let node = RemoteNode::from_value(&json!({
+            "name": "",
+            "type": "folder",
+            "drivewsid": ROOT_DRIVEWSID,
+        }));
+        assert_eq!(node.display_name(), ROOT_DRIVEWSID);
+        assert_eq!(safe_node_name("///"), None);
+        assert_eq!(safe_node_name(".."), None);
+    }
+
+    #[test]
+    fn add_file_payload_matches_python_contentws_shape() {
+        let receipt = json!({
+            "fileChecksum": "checksum",
+            "wrappingKey": "wrapping",
+            "referenceChecksum": "reference",
+            "size": 1234,
+            "receipt": "receipt-data",
+        });
+        let payload = add_file_payload(
+            "BAA2B1DA-B402-4E55-A97B-F69BBE6CE9F3",
+            "ic-sync-upload-test.txt",
+            "DOCUMENT-ID",
+            1_795_451_883,
+            &receipt,
+        );
+
+        // Apple rejects a drivewsid here with 412 VALIDATING_REFERENCE_ERROR.
+        assert_eq!(
+            payload["path"]["starting_document_id"],
+            "BAA2B1DA-B402-4E55-A97B-F69BBE6CE9F3"
+        );
+        assert_eq!(payload["path"]["path"], "ic-sync-upload-test.txt");
+        assert_eq!(payload["command"], "add_file");
+        assert_eq!(payload["create_short_guid"], true);
+        assert_eq!(payload["document_id"], "DOCUMENT-ID");
+        assert_eq!(payload["allow_conflict"], true);
+        assert_eq!(payload["file_flags"]["is_writable"], true);
+        assert_eq!(payload["mtime"], 1_795_451_883_000_i64);
+        assert_eq!(payload["btime"], 1_795_451_883_000_i64);
+        assert_eq!(payload["data"]["signature"], "checksum");
+        assert_eq!(payload["data"]["wrapping_key"], "wrapping");
+        assert_eq!(payload["data"]["reference_signature"], "reference");
+        assert_eq!(payload["data"]["size"], 1234);
+        assert_eq!(payload["data"]["receipt"], "receipt-data");
+    }
+
+    #[test]
+    fn add_file_payload_uses_basename_and_root_docwsid() {
+        let payload = add_file_payload(
+            ROOT_DOCWSID,
+            "/Docs/ic-sync-upload-test.txt",
+            "DOC",
+            1,
+            &json!({"fileChecksum": "", "wrappingKey": "", "referenceChecksum": "", "size": 0, "receipt": ""}),
+        );
+        assert_eq!(payload["path"]["starting_document_id"], ROOT_DOCWSID);
+        assert_eq!(payload["path"]["path"], "ic-sync-upload-test.txt");
+        // Python omits a falsy receipt.
+        assert!(payload["data"].get("receipt").is_none());
+    }
+
+    #[test]
+    fn uploaded_document_is_read_from_nested_update_response() {
+        let response = json!({
+            "results": [{
+                "document": {
+                    "document_id": "3AADC7EA-F48A-4D88-94C9-515096DFA566",
+                    "etag": "14m1::14m0",
+                    "zone": "com.apple.CloudDocs",
+                    "item_id": "CLXZ8uBKEAAiEC1jc1PA4EDAuVNhXXlFI7Q"
+                },
+                "operation_id": "op",
+                "status": "success"
+            }],
+            "status": {"status_code": 0, "error_message": ""}
+        });
+        let document = uploaded_document(&response).unwrap();
+        assert_eq!(document.docwsid, "3AADC7EA-F48A-4D88-94C9-515096DFA566");
+        assert_eq!(document.etag.as_deref(), Some("14m1::14m0"));
+        assert_eq!(document.zone.as_deref(), Some(CLOUD_DOCS_ZONE));
+        assert!(uploaded_document(&json!({"status": {"status_code": 0}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn multipart_body_matches_python_requests_upload() {
+        use futures_util::TryStreamExt;
+
+        let form = upload_form("ic-sync-upload-test.txt", b"hello world".to_vec());
+        let boundary = form.boundary().to_string();
+        let body = form
+            .into_stream()
+            .try_fold(Vec::new(), |mut body, chunk| async move {
+                body.extend_from_slice(&chunk);
+                Ok(body)
+            })
+            .await
+            .unwrap();
+        let text = String::from_utf8(body).unwrap();
+
+        assert!(text.starts_with(&format!("--{boundary}\r\n")));
+        assert!(text.contains(
+            "Content-Disposition: form-data; name=\"ic-sync-upload-test.txt\"; \
+             filename=\"ic-sync-upload-test.txt\"\r\n"
+        ));
+        // requests/urllib3 omit a per-part Content-Type when none is supplied.
+        assert!(!text.contains("Content-Type:"));
+        assert!(text.contains("\r\n\r\nhello world\r\n"));
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+    }
 }

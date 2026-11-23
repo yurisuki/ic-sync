@@ -43,8 +43,11 @@ impl Page {
 
 #[derive(Clone, Debug)]
 pub struct TwoFactorPrompt {
+    /// Route name reported by Apple/core (shown in the verification panel).
     pub method: String,
-    pub hint: String,
+    /// Actual route chosen by core; must be replayed when submitting the code.
+    pub route: ic_core::auth::TwoFactorRoute,
+    pub hint: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +74,7 @@ pub struct SettingsDraft {
     pub theme: ThemePreference,
     pub credential_mode: CredentialMode,
     pub start_minimized: bool,
+    pub autostart: bool,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub allow_input: String,
@@ -88,6 +92,7 @@ impl SettingsDraft {
             theme: config.theme,
             credential_mode: config.credential_mode,
             start_minimized: config.start_minimized,
+            autostart: config.autostart,
             allow: config.sync_paths.clone(),
             deny: config.exclude_paths.clone(),
             allow_input: String::new(),
@@ -105,7 +110,7 @@ pub struct App {
     // Sign-in form
     pub apple_id: String,
     pub password: String,
-    pub force_sms: bool,
+    pub verification_method: worker::VerificationMethod,
     pub accept_terms: bool,
     pub code: String,
     pub two_factor: Option<TwoFactorPrompt>,
@@ -121,9 +126,16 @@ pub struct App {
 
     /// OS-reported mode, used when `config.theme` is `system`.
     pub system_mode: SystemThemeMode,
+    /// Last time the system appearance was re-probed (poll fallback).
+    last_theme_probe: Instant,
     pub secure_storage: String,
     pub secure_available: bool,
     pub tray: Option<TrayHandle>,
+    /// Whether a completed Apple sign-in is available for this session.
+    pub signed_in: bool,
+    /// The single main window, if it is currently open. Daemon mode lets us
+    /// destroy it on close without exiting the process.
+    window_id: Option<iced::window::Id>,
     last_state: Option<String>,
 }
 
@@ -133,11 +145,14 @@ pub enum Message {
 
     AppleIdChanged(String),
     PasswordChanged(String),
-    ForceSmsChanged(bool),
+    VerificationMethodChanged(worker::VerificationMethod),
+    ResendCode,
     AcceptTermsChanged(bool),
     SignIn,
     CodeChanged(String),
-    SubmitCode { force_sms: bool, accept_terms: bool },
+    SubmitCode {
+        accept_terms: bool,
+    },
 
     ForceSync,
     ToggleAutoSync,
@@ -160,7 +175,11 @@ pub enum Message {
     ThemeChanged(ThemePreference),
     CredentialModeChanged(CredentialMode),
     StartMinimizedChanged(bool),
+    AutostartChanged(bool),
     SystemThemeChanged(SystemThemeMode),
+    /// Result of the desktop-settings fallback used when iced cannot report
+    /// the system appearance (e.g. no XDG Settings portal on Hyprland).
+    SystemThemeFallback(Option<SystemThemeMode>),
     SaveSettings,
     SyncThenMove,
     DismissWarning,
@@ -168,7 +187,7 @@ pub enum Message {
     Worker(Box<WorkerEvent>),
     Tray(tray::TrayAction),
     CloseRequested(iced::window::Id),
-    WindowReady(Option<iced::window::Id>),
+    WindowOpened(iced::window::Id),
     Tick,
     ClearToast,
 }
@@ -179,11 +198,12 @@ pub fn new() -> (App, Task<Message>) {
     let draft = SettingsDraft::from_config(&config);
     let secure_available = crate::secrets::available();
     let secure_storage = secure_storage_label(config.credential_mode, secure_available);
-    let tray = tray::spawn();
 
     let signed_in = status
         .as_ref()
         .is_some_and(|s| s.state != SyncState::LoginRequired);
+    let tray = tray::spawn(signed_in);
+
     let mut app = App {
         page: if signed_in {
             Page::Dashboard
@@ -192,7 +212,7 @@ pub fn new() -> (App, Task<Message>) {
         },
         apple_id: config.username.clone(),
         password: String::new(),
-        force_sms: false,
+        verification_method: worker::VerificationMethod::TrustedDevice,
         accept_terms: false,
         code: String::new(),
         two_factor: None,
@@ -204,9 +224,12 @@ pub fn new() -> (App, Task<Message>) {
         pending_relocation: None,
         confirm_forget: false,
         system_mode: SystemThemeMode::Light,
+        last_theme_probe: Instant::now(),
         secure_storage,
         secure_available,
         tray,
+        signed_in,
+        window_id: None,
         last_state: None,
         status,
         config,
@@ -216,9 +239,31 @@ pub fn new() -> (App, Task<Message>) {
     app.log(LogLevel::Info, "IC-SYNC started");
     worker::send(GuiMessage::Bootstrap);
 
-    // Probe the OS appearance once; the subscription below keeps it in sync.
-    let system_theme_task = iced::system::theme().map(Message::SystemThemeChanged);
-    (app, system_theme_task)
+    // Probe the OS appearance once; the subscription and Tick fallback below
+    // keep it in sync when the desktop does not emit theme changes.
+    let system_theme_task = probe_system_theme();
+
+    // Daemon mode: start with no window only when already signed in AND the
+    // preference says minimized. An unsigned-in session must always show the
+    // sign-in window, otherwise the user has no way to log in from the tray.
+    // Closing a window later only destroys that window; the process and tray
+    // stay alive.
+    let window_task = if signed_in && crate::start_minimized() {
+        Task::none()
+    } else {
+        open_window()
+    };
+
+    (app, Task::batch([system_theme_task, window_task]))
+}
+
+/// Open the single main window and report its id back to the application.
+fn open_window() -> Task<Message> {
+    let (id, opened) = iced::window::open(crate::window_settings());
+    Task::batch([
+        opened.map(move |_| Message::WindowOpened(id)),
+        iced::window::gain_focus(id),
+    ])
 }
 
 /// Indicator shown in the sidebar and Settings. Plain-text mode is deliberately
@@ -253,6 +298,42 @@ pub fn theme(app: &App) -> Theme {
     }
 }
 
+/// Ask Iced for the system appearance. Its `theme_changes` subscription relies
+/// on the XDG Settings portal, which is silent on some desktops (notably
+/// Hyprland), so `Message::SystemThemeChanged` falls back to the desktop
+/// setting when Iced reports `None`.
+fn probe_system_theme() -> Task<Message> {
+    iced::system::theme().map(Message::SystemThemeChanged)
+}
+
+/// Last-resort appearance probe for Linux desktops where the XDG Settings
+/// portal used by Iced does not expose `color-scheme`. Most of them (including
+/// Hyprland, GNOME and XFCE) still store the preference in gsettings.
+fn desktop_color_scheme() -> Option<SystemThemeMode> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("gsettings")
+            .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&output.stdout);
+        if value.contains("prefer-dark") {
+            Some(SystemThemeMode::Dark)
+        } else if value.contains("prefer-light") || value.contains("default") {
+            Some(SystemThemeMode::Light)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 pub fn subscription(_app: &App) -> iced::Subscription<Message> {
     iced::Subscription::batch([
         worker::subscription().map(|event| Message::Worker(Box::new(event))),
@@ -267,6 +348,23 @@ impl App {
     /// Convenience for view code that needs mode-specific colours.
     pub fn is_dark(&self) -> bool {
         theme(self) == Theme::Dark
+    }
+
+    /// Syncing requires a usable session. Status may lag behind `signed_in`,
+    /// so check both sources here.
+    pub fn can_sync(&self) -> bool {
+        self.signed_in
+            && !self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.state == SyncState::LoginRequired)
+    }
+
+    /// Push the current sync availability to the tray menu.
+    fn refresh_tray_actions(&self) {
+        if let Some(tray) = &self.tray {
+            tray.set_sync_enabled(self.can_sync());
+        }
     }
 
     /// Recompute the credential indicator after config/mode changes.
@@ -308,6 +406,7 @@ impl App {
                 status.pending
             ));
         }
+        self.refresh_tray_actions();
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -315,11 +414,27 @@ impl App {
             Message::Navigate(page) => {
                 self.page = page;
                 self.warning = None;
+                if page == Page::Settings {
+                    self.command(GuiMessage::RefreshAutostart);
+                }
             }
 
             Message::AppleIdChanged(value) => self.apple_id = value,
             Message::PasswordChanged(value) => self.password = value,
-            Message::ForceSmsChanged(value) => self.force_sms = value,
+            Message::VerificationMethodChanged(method) => {
+                self.verification_method = method;
+                // Re-arm code delivery for the newly selected method. The old
+                // code belongs to the previous endpoint and will be rejected.
+                if self.two_factor.is_some() {
+                    self.command(GuiMessage::ResendCode { method });
+                }
+            }
+            Message::ResendCode => {
+                self.command(GuiMessage::ResendCode {
+                    method: self.verification_method,
+                });
+                self.log(LogLevel::Info, "Re-sending verification code");
+            }
             Message::AcceptTermsChanged(value) => self.accept_terms = value,
             Message::CodeChanged(value) => self.code = value,
 
@@ -341,7 +456,7 @@ impl App {
                     self.command(GuiMessage::SignIn {
                         username: self.apple_id.trim().to_string(),
                         password: self.password.clone(),
-                        force_sms: self.force_sms,
+                        method: self.verification_method,
                         accept_terms: self.accept_terms,
                     });
                     // The password lives in the OS store after this point; the
@@ -350,10 +465,7 @@ impl App {
                 }
             }
 
-            Message::SubmitCode {
-                force_sms,
-                accept_terms,
-            } => {
+            Message::SubmitCode { accept_terms } => {
                 if self.code.trim().is_empty() {
                     self.auth_error = Some("Enter the 6-digit code.".to_string());
                 } else {
@@ -361,7 +473,6 @@ impl App {
                     self.auth_busy = true;
                     self.command(GuiMessage::SubmitCode {
                         code: self.code.trim().to_string(),
-                        force_sms,
                         accept_terms,
                     });
                     self.code.clear();
@@ -369,15 +480,16 @@ impl App {
                 }
             }
 
-            Message::ForceSync | Message::CheckStatus => {
-                let is_sync = matches!(message, Message::ForceSync);
-                if is_sync {
+            Message::ForceSync => {
+                // Both the tray item and the dashboard button are disabled
+                // while signed out; guard here too in case a stale event slips
+                // through before the tray thread processes the update.
+                if self.can_sync() {
                     self.log(LogLevel::Info, "Force sync pressed");
                     self.command(GuiMessage::ForceSync);
-                } else {
-                    self.command(GuiMessage::RefreshStatus);
                 }
             }
+            Message::CheckStatus => self.command(GuiMessage::RefreshStatus),
 
             Message::ToggleAutoSync => {
                 let enabled = !self.config.auto_sync;
@@ -495,6 +607,9 @@ impl App {
             Message::ThemeChanged(value) => {
                 self.draft.theme = value;
                 self.config.theme = value;
+                if value == ThemePreference::System {
+                    return probe_system_theme();
+                }
             }
             Message::CredentialModeChanged(value) => {
                 self.draft.credential_mode = value;
@@ -511,7 +626,25 @@ impl App {
                 self.draft.start_minimized = value;
                 self.config.start_minimized = value;
             }
-            Message::SystemThemeChanged(mode) => self.system_mode = mode,
+            Message::AutostartChanged(value) => {
+                self.draft.autostart = value;
+                self.config.autostart = value;
+                self.command(GuiMessage::SetAutostart(value));
+            }
+            Message::SystemThemeChanged(mode) => {
+                if mode == SystemThemeMode::None {
+                    // Iced could not determine the desktop appearance (no XDG
+                    // Settings portal on this compositor). Ask the desktop
+                    // directly without blocking the UI thread.
+                    return Task::perform(
+                        tokio::task::spawn_blocking(desktop_color_scheme),
+                        |result| Message::SystemThemeFallback(result.ok().flatten()),
+                    );
+                }
+                self.system_mode = mode;
+            }
+            Message::SystemThemeFallback(Some(mode)) => self.system_mode = mode,
+            Message::SystemThemeFallback(None) => {}
 
             Message::SaveSettings => {
                 let mut config = self.config.clone();
@@ -521,6 +654,7 @@ impl App {
                 config.theme = self.draft.theme;
                 config.credential_mode = self.draft.credential_mode;
                 config.start_minimized = self.draft.start_minimized;
+                config.autostart = self.draft.autostart;
                 config.sync_paths = self.draft.allow.clone();
                 config.exclude_paths = self.draft.deny.clone();
                 config.sync_interval_seconds = parse_interval(
@@ -542,7 +676,7 @@ impl App {
             }
 
             Message::SyncThenMove => {
-                if let Some(folder) = self.pending_relocation.clone() {
+                if let Some(folder) = self.pending_relocation.clone().filter(|_| self.can_sync()) {
                     self.warning = None;
                     self.log(LogLevel::Info, "Syncing, then moving sync folder");
                     self.command(GuiMessage::RelocateFolder {
@@ -559,29 +693,37 @@ impl App {
             Message::Worker(event) => return self.handle_worker(*event),
             Message::Tray(action) => match action {
                 tray::TrayAction::Open => {
-                    return iced::window::latest().map(Message::WindowReady);
+                    // Reuse the existing window when it is open; otherwise open
+                    // a fresh one. This is the only reliable "show" on Wayland.
+                    return match self.window_id {
+                        Some(id) => iced::window::gain_focus(id),
+                        None => open_window(),
+                    };
                 }
                 tray::TrayAction::SyncNow => {
-                    self.log(LogLevel::Info, "Sync requested from tray");
-                    self.command(GuiMessage::ForceSync);
+                    if self.can_sync() {
+                        self.log(LogLevel::Info, "Sync requested from tray");
+                        self.command(GuiMessage::ForceSync);
+                    }
                 }
                 tray::TrayAction::Quit => {
                     self.log(LogLevel::Info, "Quit requested from tray");
                     self.command(GuiMessage::Shutdown);
+                    self.window_id = None;
                     return iced::exit();
                 }
             },
             Message::CloseRequested(id) => {
-                // Keep syncing in the background; the tray icon reopens the window.
-                return iced::window::set_mode(id, iced::window::Mode::Hidden);
+                // Destroy only the window. Iced is running in daemon mode, so
+                // the process, tray icon and sync engine stay alive. The tray
+                // menu opens a new window on demand.
+                self.window_id = None;
+                return iced::window::close(id);
             }
-            Message::WindowReady(Some(id)) => {
-                return Task::batch([
-                    iced::window::set_mode(id, iced::window::Mode::Windowed),
-                    iced::window::gain_focus(id),
-                ]);
+            Message::WindowOpened(id) => {
+                self.window_id = Some(id);
+                return iced::window::gain_focus(id);
             }
-            Message::WindowReady(None) => {}
 
             Message::Tick => {
                 if self
@@ -590,6 +732,13 @@ impl App {
                     .is_some_and(|t| Instant::now() >= t.expires)
                 {
                     self.toast = None;
+                }
+                // Polling fallback: some desktops never emit theme changes,
+                // so re-read the OS appearance every few seconds. This is
+                // cheap and also keeps the gsettings fallback up to date.
+                if Instant::now().duration_since(self.last_theme_probe) >= Duration::from_secs(3) {
+                    self.last_theme_probe = Instant::now();
+                    return probe_system_theme();
                 }
             }
             Message::ClearToast => self.toast = None,
@@ -613,6 +762,7 @@ impl App {
                     self.apple_id = config.username.clone();
                 }
                 if let Some(status) = status {
+                    self.signed_in = status.state != SyncState::LoginRequired;
                     self.push_status_to_tray(&status);
                     self.status = Some(status);
                 }
@@ -620,6 +770,9 @@ impl App {
             }
             WorkerEvent::Connecting => self.log(LogLevel::Info, "Connecting to iCloud Drive…"),
             WorkerEvent::Status(status) => {
+                if status.state == SyncState::LoginRequired {
+                    self.signed_in = false;
+                }
                 let label = state_label(&status.state);
                 if self.last_state.as_deref() != Some(label) {
                     self.last_state = Some(label.to_string());
@@ -628,14 +781,30 @@ impl App {
                 self.push_status_to_tray(&status);
                 self.status = Some(status);
             }
-            WorkerEvent::TwoFactorRequired { method, hint } => {
+            WorkerEvent::TwoFactorRequired {
+                method,
+                route,
+                hint,
+            } => {
                 self.auth_busy = false;
-                self.two_factor = Some(TwoFactorPrompt { method, hint });
+                self.signed_in = false;
+                self.refresh_tray_actions();
+                self.verification_method = match route {
+                    ic_core::auth::TwoFactorRoute::Sms => worker::VerificationMethod::Sms,
+                    _ => worker::VerificationMethod::TrustedDevice,
+                };
+                self.two_factor = Some(TwoFactorPrompt {
+                    method,
+                    route,
+                    hint,
+                });
                 self.page = Page::Setup;
                 self.toast(LogLevel::Warning, "Two-factor verification required.");
             }
             WorkerEvent::SignedIn => {
                 self.auth_busy = false;
+                self.signed_in = true;
+                self.refresh_tray_actions();
                 self.two_factor = None;
                 self.auth_error = None;
                 self.page = Page::Dashboard;
@@ -652,7 +821,15 @@ impl App {
                 self.refresh_secure_storage();
                 self.toast(LogLevel::Success, "Settings saved.");
             }
+            WorkerEvent::AutostartState(enabled) => {
+                // The OS is the source of truth for autostart (it can be changed
+                // outside the app).
+                self.config.autostart = enabled;
+                self.draft.autostart = enabled;
+            }
             WorkerEvent::SessionForgotten => {
+                self.signed_in = false;
+                self.refresh_tray_actions();
                 self.page = Page::Setup;
                 self.password.clear();
                 self.apple_id.clear();
@@ -681,6 +858,8 @@ impl App {
             }
             WorkerEvent::Error { context, message } => {
                 self.auth_busy = false;
+                // Core's typed CodeRejected error already explains -21669 and
+                // which method the code must come from; show it verbatim.
                 self.auth_error = Some(message.clone());
                 let combined = if context.is_empty() {
                     message
@@ -741,13 +920,12 @@ impl App {
         });
 
         let mut nav = column![].spacing(6).padding([SPACE_LARGE, SPACE]);
-        for page in [
-            Page::Setup,
-            Page::Dashboard,
-            Page::Settings,
-            Page::Activity,
-            Page::About,
-        ] {
+        let pages: &[Page] = if self.signed_in {
+            &[Page::Dashboard, Page::Settings, Page::Activity, Page::About]
+        } else {
+            &[Page::Setup, Page::Settings, Page::Activity, Page::About]
+        };
+        for &page in pages {
             let label = page.label();
             let style = if self.page == page {
                 theme::primary_button
@@ -759,6 +937,27 @@ impl App {
                     .width(iced::Fill)
                     .on_press(Message::Navigate(page))
                     .style(style),
+            );
+        }
+        // Push the account block to the bottom-left of the sidebar.
+        nav = nav.push(container(text("")).height(iced::Fill));
+        if self.signed_in {
+            let account_label = if self.apple_id.is_empty() {
+                "Account".to_owned()
+            } else {
+                self.apple_id.chars().take(24).collect::<String>()
+            };
+            nav = nav.push(
+                button(
+                    column![
+                        text("Account").size(12).color(theme::text_muted(dark)),
+                        text(account_label).size(13),
+                    ]
+                    .spacing(2),
+                )
+                .width(iced::Fill)
+                .on_press(Message::Navigate(Page::Settings))
+                .style(theme::secondary_button),
             );
         }
         nav = nav.push(

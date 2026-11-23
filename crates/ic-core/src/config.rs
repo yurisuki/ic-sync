@@ -146,6 +146,8 @@ pub struct Config {
     /// window is shown on launch. Core only persists the preference.
     #[serde(default = "default_true")]
     pub start_minimized: bool,
+    #[serde(default)]
+    pub autostart: bool,
     #[serde(default = "default_warmup_workers")]
     pub warmup_workers: usize,
     #[serde(default = "default_conflict_mode")]
@@ -333,6 +335,7 @@ impl Config {
             instant_sync: true,
             theme: ThemePreference::default(),
             start_minimized: true,
+            autostart: false,
             warmup_workers: default_warmup_workers(),
             conflict_mode: ConflictMode::Copy,
             last_sync_at: None,
@@ -649,6 +652,7 @@ mod tests {
         assert!(config.auto_sync);
         assert!(config.instant_sync);
         assert!(config.start_minimized);
+        assert!(!config.autostart);
         assert_eq!(config.theme, ThemePreference::System);
         assert_eq!(config.credential_mode, CredentialMode::Secure);
         assert_eq!(config.sync_interval_seconds, 15);
@@ -700,6 +704,7 @@ mod tests {
         assert_eq!(config.credential_mode, CredentialMode::Secure);
         assert!(config.instant_sync);
         assert!(config.start_minimized);
+        assert!(!config.autostart);
         assert_eq!(config.sync_interval_seconds, 15);
         assert_eq!(config.upload_interval_seconds, 5);
 
@@ -709,6 +714,7 @@ mod tests {
             "credential_mode: secure",
             "instant_sync: true",
             "start_minimized: true",
+            "autostart: false",
         ] {
             assert!(yaml.contains(expected), "missing {expected} in:\n{yaml}");
         }
@@ -719,12 +725,14 @@ mod tests {
                  theme: dark\n\
                  credential_mode: plain\n\
                  start_minimized: false\n\
+                 autostart: true\n\
                  instant_sync: false\n",
         ))
         .unwrap();
         assert_eq!(dark_plain.theme, ThemePreference::Dark);
         assert_eq!(dark_plain.credential_mode, CredentialMode::Plain);
         assert!(!dark_plain.start_minimized);
+        assert!(dark_plain.autostart);
         assert!(!dark_plain.instant_sync);
     }
 

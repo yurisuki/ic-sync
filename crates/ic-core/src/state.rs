@@ -481,6 +481,29 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_all_conflict_pending(&self) -> Result<()> {
+        let conn = self.connection.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_ops WHERE path LIKE '%.local-conflict-%' \
+             OR target_path LIKE '%.local-conflict-%'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Remove queued operations for a local-only subtree (e.g. conflict copies)
+    /// without touching the entries themselves.
+    pub fn clear_pending_subtree(&self, path: &str) -> Result<()> {
+        let conn = self.connection.lock().unwrap();
+        let like = format!("{path}/%");
+        conn.execute(
+            "DELETE FROM pending_ops WHERE path=?1 OR path LIKE ?2 \
+             OR target_path=?1 OR target_path LIKE ?2",
+            params![path, like],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_clean(&self, path: &str, last_synced_at: i64, sha256: Option<&str>) -> Result<()> {
         let conn = self.connection.lock().unwrap();
         conn.execute(

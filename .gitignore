@@ -30,7 +30,8 @@ icloud.env
 *.env
 !.env.example
 credentials.*
-secrets.*
+# Only ignore root-level secret files; do not ignore Rust source modules like `src/secrets.rs`.
+/secrets.*
 *.p12
 *.pem
 *.key

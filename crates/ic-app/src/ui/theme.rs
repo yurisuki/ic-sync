@@ -286,6 +286,23 @@ pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style 
     style
 }
 
+/// Muted style for actions that cannot be used right now (e.g. syncing while
+/// signed out). Buttons using this style are built without `on_press`, so Iced
+/// also treats them as non-interactive.
+pub fn disabled_button(theme: &Theme, _status: button::Status) -> button::Style {
+    let dark = is_dark(theme);
+    button::Style {
+        background: Some(Background::Color(elevated_surface(dark))),
+        text_color: text_muted(dark),
+        border: Border {
+            color: border(dark),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 /// Warning style used for the explicitly unsafe plain-text choice.
 pub fn unsafe_button(theme: &Theme, status: button::Status) -> button::Style {
     let dark = is_dark(theme);

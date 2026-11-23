@@ -38,8 +38,10 @@ IC-SYNC keeps a **user-selected local folder** in sync with iCloud Drive. It is 
 
 ## Features
 
-- Sign in with an Apple ID, including 2FA by SMS, voice call or trusted device.
-  Trust tokens are handled automatically — no manual entry in the normal flow.
+- Sign in with an Apple ID and 2FA via a **Verification method** selector:
+  **iPhone / trusted device (recommended)** or **SMS to trusted number**. The
+  code must match the selected method. Trust/session tokens are handled
+  automatically — no manual entry in the normal flow.
 - **Secure credential storage by default** — with `credential_mode: secure` (the
   default), password and session secrets go to Windows Credential Manager or the
   Linux Secret Service/keyring, never to a config file. An explicit `plain`
@@ -55,9 +57,15 @@ IC-SYNC keeps a **user-selected local folder** in sync with iCloud Drive. It is 
   are more responsive but make more Apple API requests; Relaxed is gentlest.
 - Theme preference: **System** (follows your desktop), **Light** or **Dark**,
   saved in the config.
-- **Start minimized to tray** (on by default): launch with only the tray icon;
-  closing the window (X) also just hides to the tray while syncing continues.
-  **Quit** in the tray menu exits completely.
+- **Start minimized to tray** (on by default): launch minimized to the
+  tray/taskbar; closing the window (X, Super+Q or a window-manager close) also
+  minimizes instead of exiting, so syncing continues. **Quit** in the tray menu
+  exits completely.
+- **Launch at login (autostart, off by default):** in Settings → Startup; uses an
+  XDG autostart `.desktop` entry on Linux (`~/.config/autostart/`) or a per-user
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry on Windows.
+  Autostarted launches are minimized to the tray/taskbar and respect the
+  **Start minimized to tray** setting; turning it off removes the entry.
 - Conflict copies instead of silent data loss: a locally edited file whose
   remote counterpart changed is preserved as
   `<name>.local-conflict-<YYYYMMDDHHMMSS>`.
@@ -90,8 +98,10 @@ IC-SYNC keeps a **user-selected local folder** in sync with iCloud Drive. It is 
 
 3. On first launch, sign in with your Apple ID and choose the local folder to
    sync. **Start minimized to tray** is on by default, so IC-SYNC can launch
-   hidden in the tray — choose **Open IC-SYNC** from the tray menu to show the
-   window. See the [User Guide](docs/USER_GUIDE.md) for the full walkthrough.
+   minimized to the tray/taskbar — choose **Open IC-SYNC** from the tray menu to
+   restore and focus the window. Enable **Launch at login** in Settings → Startup
+   if you want IC-SYNC to start with your session (off by default). See the
+   [User Guide](docs/USER_GUIDE.md) for the full walkthrough.
 
 ### Build from source
 

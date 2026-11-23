@@ -26,6 +26,24 @@ pub enum LogLevel {
     Error,
 }
 
+/// The verification method offered in the sign-in UI. The exact core route
+/// returned by `authenticate()` is stored in `AuthContext` and replayed on
+/// `submit_code`; this enum only represents the user's choice/intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationMethod {
+    TrustedDevice,
+    Sms,
+}
+
+impl VerificationMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TrustedDevice => "iPhone / trusted device",
+            Self::Sms => "SMS to trusted number",
+        }
+    }
+}
+
 /// Commands sent from the GUI to the core worker.
 #[derive(Clone, Debug)]
 pub enum GuiMessage {
@@ -34,17 +52,23 @@ pub enum GuiMessage {
     SignIn {
         username: String,
         password: String,
-        force_sms: bool,
+        method: VerificationMethod,
         accept_terms: bool,
     },
     SubmitCode {
         code: String,
-        force_sms: bool,
         accept_terms: bool,
+    },
+    /// Re-issue the challenge for the selected method (method switches must
+    /// re-arm delivery before the new code is valid).
+    ResendCode {
+        method: VerificationMethod,
     },
     ForceSync,
     RefreshStatus,
     SetAutoSync(bool),
+    SetAutostart(bool),
+    RefreshAutostart,
     ForgetSession,
     SaveSettings(Box<Config>),
     RelocateFolder {
@@ -68,12 +92,16 @@ pub enum WorkerEvent {
     Status(ServiceStatus),
     TwoFactorRequired {
         method: String,
-        hint: String,
+        /// Route selected by core; replayed verbatim on submit.
+        route: ic_core::auth::TwoFactorRoute,
+        hint: Option<String>,
     },
     SignedIn,
     SyncStarted,
     SyncFinished,
     SettingsSaved(Config),
+    /// Current autostart state as reported by the OS.
+    AutostartState(bool),
     SessionForgotten,
     Relocated {
         moved: String,
@@ -180,6 +208,14 @@ fn event_stream() -> impl Stream<Item = WorkerEvent> {
     })
 }
 
+/// State for the in-flight 2FA challenge. The route comes from core and must
+/// be replayed exactly when the code is submitted.
+#[derive(Default)]
+struct AuthContext {
+    selected: Option<VerificationMethod>,
+    route: Option<ic_core::auth::TwoFactorRoute>,
+}
+
 struct Worker {
     commands: mpsc::Receiver<GuiMessage>,
     events: EventSender,
@@ -187,6 +223,7 @@ struct Worker {
     api: Option<Arc<ICloudApi>>,
     engine: Option<SyncEngine>,
     secure_storage: bool,
+    auth: AuthContext,
 }
 
 async fn run(commands: mpsc::Receiver<GuiMessage>, events: EventSender) {
@@ -199,6 +236,7 @@ async fn run(commands: mpsc::Receiver<GuiMessage>, events: EventSender) {
         api: None,
         engine: None,
         secure_storage,
+        auth: AuthContext::default(),
     };
 
     while let Some(message) = worker.commands.recv().await {
@@ -207,21 +245,22 @@ async fn run(commands: mpsc::Receiver<GuiMessage>, events: EventSender) {
             GuiMessage::SignIn {
                 username,
                 password,
-                force_sms,
+                method,
                 accept_terms,
             } => {
                 worker
-                    .sign_in(username, password, force_sms, accept_terms)
+                    .sign_in(username, password, method, accept_terms)
                     .await
             }
-            GuiMessage::SubmitCode {
-                code,
-                force_sms,
-                accept_terms,
-            } => worker.submit_code(code, force_sms, accept_terms).await,
+            GuiMessage::SubmitCode { code, accept_terms } => {
+                worker.submit_code(code, accept_terms).await
+            }
+            GuiMessage::ResendCode { method } => worker.resend_code(method).await,
             GuiMessage::ForceSync => worker.force_sync().await,
             GuiMessage::RefreshStatus => worker.refresh_status(),
             GuiMessage::SetAutoSync(enabled) => worker.set_auto_sync(enabled),
+            GuiMessage::SetAutostart(enabled) => worker.set_autostart(enabled),
+            GuiMessage::RefreshAutostart => worker.refresh_autostart(),
             GuiMessage::ForgetSession => worker.forget_session(),
             GuiMessage::SaveSettings(config) => worker.save_settings(*config),
             GuiMessage::RelocateFolder {
@@ -327,6 +366,13 @@ impl Worker {
             self.error("Reading saved credentials", &err);
         }
 
+        // The OS is the source of truth for autostart: it can be toggled by
+        // desktop settings or a failed write outside this app.
+        match ic_core::autostart::is_enabled() {
+            Ok(enabled) => config.autostart = enabled,
+            Err(err) => self.error("Reading launch-at-login state", &err),
+        }
+
         let status = status::read_status().ok().flatten();
         self.config = config.clone();
         self.secure_storage = ic_core::config::credential_storage_ready(config.credential_mode);
@@ -388,7 +434,7 @@ impl Worker {
         &mut self,
         username: String,
         password: String,
-        force_sms: bool,
+        method: VerificationMethod,
         accept_terms: bool,
     ) {
         if !accept_terms {
@@ -416,8 +462,10 @@ impl Worker {
 
         // Trust/session tokens are handled by `ic-core::auth` automatically;
         // the GUI no longer exposes a manual token field.
+        self.auth.selected = Some(method);
+        self.auth.route = None;
         let options = AuthOptions {
-            force_sms,
+            force_sms: method == VerificationMethod::Sms,
             trust_token: None,
             accept_terms,
         };
@@ -439,11 +487,19 @@ impl Worker {
                 self.activity(LogLevel::Success, "Signed in successfully.");
                 self.refresh_status();
             }
-            Ok(AuthStep::TwoFactorRequired { method, hint }) => {
+            Ok(AuthStep::TwoFactorRequired {
+                method,
+                hint,
+                route,
+            }) => {
                 self.api = Some(api);
+                // Remember the exact route so the code is answered on the same
+                // Apple endpoint that issued it.
+                self.auth.route = Some(route);
                 self.emit(WorkerEvent::TwoFactorRequired {
                     method,
-                    hint: hint.unwrap_or_else(|| "No hint available".to_string()),
+                    route,
+                    hint,
                 });
                 self.activity(LogLevel::Info, "Two-factor code required.");
             }
@@ -464,7 +520,7 @@ impl Worker {
         }
     }
 
-    async fn submit_code(&mut self, code: String, force_sms: bool, accept_terms: bool) {
+    async fn submit_code(&mut self, code: String, accept_terms: bool) {
         let Some(api) = self.api.clone() else {
             self.emit(WorkerEvent::Toast {
                 level: LogLevel::Warning,
@@ -473,24 +529,92 @@ impl Worker {
             return;
         };
 
-        match auth::submit_code(&api, &code, force_sms, accept_terms).await {
+        // Use the route core selected when it issued the challenge; never
+        // re-detect it here (that was the source of -21669 routing errors).
+        let route = self.auth.route.unwrap_or(match self.auth.selected {
+            Some(VerificationMethod::Sms) => ic_core::auth::TwoFactorRoute::Sms,
+            Some(VerificationMethod::TrustedDevice) | None => {
+                ic_core::auth::TwoFactorRoute::TrustedDeviceLegacy
+            }
+        });
+
+        match auth::submit_code(&api, &code, route, accept_terms).await {
             Ok(AuthStep::Authenticated) => {
+                self.auth.route = None;
                 self.start_engine(api).await;
                 self.emit(WorkerEvent::SignedIn);
                 self.activity(LogLevel::Success, "Two-factor code accepted.");
                 self.refresh_status();
             }
-            Ok(AuthStep::TwoFactorRequired { method, hint }) => {
+            Ok(AuthStep::TwoFactorRequired {
+                method,
+                hint,
+                route,
+            }) => {
+                self.auth.route = Some(route);
                 self.emit(WorkerEvent::TwoFactorRequired {
                     method,
-                    hint: hint.unwrap_or_else(|| "Check your trusted device".to_string()),
+                    route,
+                    hint,
                 });
                 self.emit(WorkerEvent::Toast {
                     level: LogLevel::Warning,
-                    message: "That code was not accepted. Please try again.".to_string(),
+                    message: "That code was not accepted. Check the selected method and try again."
+                        .to_string(),
                 });
             }
             Err(err) => self.error("Two-factor code", &err),
+        }
+    }
+
+    /// Re-arm code delivery after the user changes verification method.
+    async fn resend_code(&mut self, method: VerificationMethod) {
+        let Some(api) = self.api.clone() else {
+            self.emit(WorkerEvent::Toast {
+                level: LogLevel::Warning,
+                message: "Start a sign-in before requesting a code.".to_string(),
+            });
+            return;
+        };
+
+        let route = match method {
+            VerificationMethod::Sms => ic_core::auth::TwoFactorRoute::Sms,
+            VerificationMethod::TrustedDevice => match self.auth.route {
+                // Keep the exact device variant core reported (legacy vs bridge).
+                Some(
+                    r @ (ic_core::auth::TwoFactorRoute::TrustedDeviceLegacy
+                    | ic_core::auth::TwoFactorRoute::TrustedDeviceBridge),
+                ) => r,
+                _ => ic_core::auth::TwoFactorRoute::TrustedDeviceLegacy,
+            },
+        };
+        self.auth.selected = Some(method);
+        self.activity(
+            LogLevel::Info,
+            format!("Requesting a new verification code via {}.", method.label()),
+        );
+        match auth::request_verification_route(&api, route).await {
+            Ok(()) => {
+                self.auth.route = Some(route);
+                self.emit(WorkerEvent::TwoFactorRequired {
+                    method: route.method().to_string(),
+                    route,
+                    hint: None,
+                });
+                self.emit(WorkerEvent::Toast {
+                    level: LogLevel::Success,
+                    message: format!("A new code was requested via {}.", route.method()),
+                });
+            }
+            Err(err) => {
+                self.error("Re-sending verification code", &err);
+                self.emit(WorkerEvent::Toast {
+                    level: LogLevel::Warning,
+                    message: "That method could not be re-armed. Restart sign-in to request a \
+                              fresh code, then choose the method again."
+                        .to_string(),
+                });
+            }
         }
     }
 
@@ -559,6 +683,43 @@ impl Worker {
         );
     }
 
+    /// Apply the launch-at-login switch on the worker thread; never do OS
+    /// registry/desktop-file work on the UI thread.
+    fn set_autostart(&mut self, enabled: bool) {
+        match ic_core::autostart::set_enabled(enabled, self.config.start_minimized) {
+            Ok(()) => {
+                self.config.autostart = enabled;
+                self.persist(&self.config);
+                self.emit(WorkerEvent::AutostartState(enabled));
+                self.emit(WorkerEvent::Toast {
+                    level: LogLevel::Success,
+                    message: if enabled {
+                        "IC-SYNC will launch at login.".to_string()
+                    } else {
+                        "Launch at login disabled.".to_string()
+                    },
+                });
+            }
+            Err(err) => {
+                self.error("Changing launch at login", &err);
+                self.emit(WorkerEvent::Toast {
+                    level: LogLevel::Warning,
+                    message: "Could not change launch at login. Check platform support and \
+                              permissions, then try again."
+                        .to_string(),
+                });
+                self.emit(WorkerEvent::AutostartState(self.config.autostart));
+            }
+        }
+    }
+
+    fn refresh_autostart(&self) {
+        match ic_core::autostart::is_enabled() {
+            Ok(enabled) => self.emit(WorkerEvent::AutostartState(enabled)),
+            Err(err) => self.error("Reading launch-at-login state", &err),
+        }
+    }
+
     fn save_settings(&mut self, config: Config) {
         use ic_core::config::CredentialMode;
 
@@ -586,8 +747,29 @@ impl Worker {
             }
         }
 
+        let old_autostart = self.config.autostart;
+        let old_start_minimized = self.config.start_minimized;
+
         self.persist(&next);
         self.config = next;
+
+        // Keep the OS launch entry in sync with the saved preferences.
+        let autostart_changed = self.config.autostart != old_autostart;
+        let minimized_changed =
+            self.config.autostart && self.config.start_minimized != old_start_minimized;
+        if (autostart_changed || minimized_changed)
+            && let Err(err) =
+                ic_core::autostart::set_enabled(self.config.autostart, self.config.start_minimized)
+        {
+            self.error("Updating launch at login", &err);
+            self.emit(WorkerEvent::Toast {
+                level: LogLevel::Warning,
+                message: "Settings saved, but launch at login could not be updated. \
+                          Check platform support and permissions."
+                    .to_string(),
+            });
+        }
+
         let mut view = self.config.clone();
         view.password.clear();
         self.emit(WorkerEvent::SettingsSaved(view));

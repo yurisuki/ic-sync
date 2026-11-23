@@ -7,8 +7,9 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -20,7 +21,9 @@ use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::api::{ICloudApi, ROOT_DRIVEWSID, RemoteNode};
+use crate::api::{
+    CLOUD_DOCS_ZONE, ICloudApi, ROOT_DOCWSID, ROOT_DRIVEWSID, RemoteNode, uploaded_document,
+};
 use crate::config::{self, Config};
 use crate::error::{Error, Result};
 use crate::mirror::{Mirror, basename, conflict_path, join_path, parent_path};
@@ -80,6 +83,13 @@ impl RemoteSyncSignal {
     }
 }
 
+/// The last authoritative remote view: paths we mirror and ids we own.
+#[derive(Clone)]
+struct RemoteView {
+    paths: HashSet<String>,
+    ids: HashSet<String>,
+}
+
 struct EngineInner {
     api: Arc<ICloudApi>,
     mirror: Arc<Mirror>,
@@ -91,12 +101,15 @@ struct EngineInner {
     shutdown: AtomicBool,
     started: AtomicBool,
     downloads: mpsc::UnboundedSender<String>,
-    download_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    download_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
     scheduled: Arc<std::sync::Mutex<HashSet<String>>>,
     download_slots: Arc<Semaphore>,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     watcher: std::sync::Mutex<Option<notify::RecommendedWatcher>>,
     status_cache: std::sync::Mutex<ServiceStatus>,
+    /// Set by the first successful crawl; gates stale-row purging so an empty
+    /// pre-crawl view can never wipe a legitimate cache.
+    remote_view: std::sync::Mutex<Option<RemoteView>>,
     last_sync_at: AtomicI64,
     /// Lets `&self` methods hand an owned `Arc` to spawned 'static tasks.
     self_ref: std::sync::OnceLock<Arc<EngineInner>>,
@@ -116,6 +129,7 @@ impl SyncEngine {
         let state = Arc::new(Database::open(&config.state_db())?);
         let mirror = Arc::new(Mirror::new(config.sync_folder.clone(), config.tmp_dir())?);
         let (downloads, download_rx) = mpsc::unbounded_channel();
+        let workers = config.warmup_workers.max(1);
         let last = config.last_sync_at.unwrap_or(0);
         let status = ServiceStatus::new(SyncState::Unknown, "engine initialized");
         let inner = Arc::new(EngineInner {
@@ -128,12 +142,13 @@ impl SyncEngine {
             shutdown: AtomicBool::new(false),
             started: AtomicBool::new(false),
             downloads,
-            download_rx: Mutex::new(Some(download_rx)),
+            download_rx: Arc::new(Mutex::new(download_rx)),
             scheduled: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            download_slots: Arc::new(Semaphore::new(1)),
+            download_slots: Arc::new(Semaphore::new(workers)),
             tasks: std::sync::Mutex::new(Vec::new()),
             watcher: std::sync::Mutex::new(None),
             status_cache: std::sync::Mutex::new(status),
+            remote_view: std::sync::Mutex::new(None),
             last_sync_at: AtomicI64::new(last),
             self_ref: std::sync::OnceLock::new(),
         });
@@ -345,7 +360,7 @@ impl EngineInner {
             Error::Http(_) | Error::Offline(_) => {
                 self.publish(SyncState::Offline, format!("offline: {error}"));
             }
-            Error::Auth(_) | Error::TwoFactor(_) => {
+            Error::Auth(_) | Error::TwoFactor(_) | Error::CodeRejected(_) => {
                 self.publish(SyncState::LoginRequired, error.to_string());
             }
             _ => {
@@ -385,8 +400,9 @@ impl EngineInner {
         if self.started.swap(true, AtomicOrdering::SeqCst) {
             return Ok(());
         }
-        if let Some(receiver) = self.download_rx.lock().await.take() {
-            self.spawn_hydration_loop(receiver);
+        let workers = self.cfg().warmup_workers.max(1);
+        for _ in 0..workers {
+            self.spawn_hydration_loop(self.download_rx.clone());
         }
         self.spawn_request_loop();
         self.spawn_status_loop();
@@ -404,16 +420,10 @@ impl EngineInner {
         }
 
         self.publish(SyncState::Syncing, "starting iCloud sync");
-        if self.state.count_entries()? > 0 && self.mirror.exists("/") {
-            info!(
-                "using persistent local cache at {}",
-                self.mirror.root().display()
-            );
-            self.reconcile_cache()?;
-        } else {
-            info!("no persistent cache found; performing first remote crawl");
-            self.crawl_and_apply().await?;
-        }
+        // The remote snapshot is authoritative. Rebuilding from the cached DB
+        // here is what resurrects folders that were deleted locally/remotely.
+        info!("rebuilding local mirror from current iCloud metadata");
+        self.crawl_and_apply().await?;
         self.schedule_all_unhydrated()?;
 
         if self.cfg().auto_sync {
@@ -558,11 +568,21 @@ impl EngineInner {
                 if relative.as_os_str().is_empty() {
                     continue;
                 }
-                let relative = relative.to_string_lossy().replace('\\', "/");
+                // Canonical iCloud paths always start with '/'. Without this,
+                // watcher events create DB rows like "Alibaba" instead of
+                // "/Alibaba", which are then uploaded as bogus root items.
+                let relative =
+                    config::normalize_icloud_path(&relative.to_string_lossy().replace('\\', "/"));
+                if relative == "/" {
+                    continue;
+                }
                 if !watcher_inner.path_allowed(&relative) {
                     continue;
                 }
                 let result = if path.exists() {
+                    if watcher_inner.is_ignorable_empty_ghost(&relative) {
+                        continue;
+                    }
                     watcher_inner.mark_local_change(&relative)
                 } else {
                     watcher_inner.mark_local_delete(&relative)
@@ -598,40 +618,29 @@ impl EngineInner {
 
     async fn crawl_and_apply(&self) -> Result<()> {
         let crawl_started_at = chrono::Utc::now().timestamp();
-        let mut snapshot = HashMap::new();
-        let mut queue = vec![("/".to_string(), self.api.root().await?)];
-        for app in self.api.app_libraries().await.unwrap_or_default() {
-            if self.path_allowed(&format!("/{}", app.name)) {
-                queue.push((format!("/{}", app.name), app));
-            }
-        }
-        let mut visited = HashSet::new();
-        while let Some((parent, node)) = queue.pop() {
-            if !visited.insert(node.drivewsid.clone()) {
-                continue;
-            }
-            let path = if parent == "/" && node.drivewsid == ROOT_DRIVEWSID {
-                "/".to_string()
-            } else {
-                join_path(&parent, &node.name)
-            };
-            if path == "/TRASH_ROOT" || path.starts_with("/TRASH_ROOT/") {
-                continue;
-            }
-            if !self.path_allowed(&path) {
-                continue;
-            }
-            let children = node.items.clone().unwrap_or_default();
-            snapshot.insert(path.clone(), node);
-            for child in children {
-                queue.push((path.clone(), child));
-            }
-        }
+        // The Python reference crawls only `root.get_children()`. Apple already
+        // lists the user's app libraries there (e.g. Pages); `app_libraries()`
+        // is a catalogue of *all* app containers and must not be mirrored as
+        // top-level folders. The old code did exactly that and doubled names.
+        let root = self.api.root().await?;
+        let (nodes, id_paths) =
+            collect_remote_nodes(&self.api, root, |path| self.path_allowed(path)).await?;
+        let snapshot: HashMap<String, RemoteNode> = nodes.into_iter().collect();
+        let view = RemoteView {
+            paths: snapshot.keys().cloned().collect(),
+            ids: snapshot
+                .values()
+                .map(|node| node.drivewsid.clone())
+                .collect(),
+        };
+        *self.remote_view.lock().unwrap() = Some(view.clone());
+        // Reconcile against the authoritative view before the watcher/upload
+        // loops can see (and recreate) stale local or DB state.
+        purge_stale_entries(&self.state, &self.mirror, &view)?;
+        drop_stale_duplicates(&self.state, &self.mirror)?;
+        reconcile_bad_paths(&self.state, &self.mirror, &id_paths, &snapshot)?;
 
-        let remote_ids: HashSet<String> = snapshot
-            .values()
-            .map(|node| node.drivewsid.clone())
-            .collect();
+        let remote_ids: HashSet<String> = view.ids.clone();
         let mut handled = HashSet::new();
         for (path, node) in &snapshot {
             let by_id = self.state.get_entry_by_remote_id(&node.drivewsid)?;
@@ -665,6 +674,18 @@ impl EngineInner {
                 }
             } else {
                 if entry.path != *path {
+                    if is_duplicate_path(&entry.path, path) {
+                        // Reconciliation only removes empty directories. If a
+                        // duplicate has real content, moving it over the
+                        // canonical path could clobber it; leave and report.
+                        warn!(
+                            "keeping duplicate directory {}; canonical path {path} is occupied",
+                            entry.path
+                        );
+                        handled.insert(entry.path.clone());
+                        handled.insert(path.clone());
+                        continue;
+                    }
                     self.rename_local_tree(&entry.path, path)?;
                 }
                 self.refresh_clean_entry(path, node, crawl_started_at)
@@ -678,6 +699,20 @@ impl EngineInner {
             {
                 continue;
             }
+            // A directory shaped like `<name>/<name>` is the signature of the
+            // old path bug. Reconciliation handles the safe (empty) ones; never
+            // recursively delete one that still holds content. The same care
+            // applies to a parent about to be removed recursively: it may
+            // still contain a duplicate we deliberately left in place.
+            if entry.is_dir()
+                && (is_duplicate_shape(&entry.path) || self.has_duplicate_child(&entry.path))
+            {
+                debug!(
+                    "keeping directory {}; duplicate content is not proven safe to remove",
+                    entry.path
+                );
+                continue;
+            }
             // Conflict copies and local-only files have no remote identity yet.
             let Some(remote_id) = entry.remote_drivewsid.as_deref() else {
                 continue;
@@ -687,6 +722,19 @@ impl EngineInner {
             }
             if entry.dirty {
                 if entry.synced_path.as_deref() == Some(entry.path.as_str()) {
+                    continue;
+                }
+                if entry.is_dir()
+                    && is_duplicate_shape(&entry.path)
+                    && self
+                        .state
+                        .list_subtree(&entry.path)?
+                        .iter()
+                        .all(|child| child.is_dir())
+                {
+                    // The remote id vanished; clearing it would just hand the
+                    // stale duplicate to the upload loop. Drop the row quietly.
+                    self.state.remove_subtree(&entry.path)?;
                     continue;
                 }
                 self.state.clear_remote_identity(&entry.path)?;
@@ -769,6 +817,14 @@ impl EngineInner {
         if node.is_dir() {
             self.mirror.ensure_dir(path)?;
             entry.hydrated = true;
+        } else if old.hydrated
+            && self.mirror.exists(path)
+            && old.size == node.size
+            && entry.local_sha256.is_some()
+        {
+            // Already hydrated with matching size. Metadata-only crawls must not
+            // replace real content with a fresh placeholder.
+            entry.hydrated = true;
         } else if changed || !self.mirror.exists(path) {
             if node.size > 0 {
                 self.mirror
@@ -839,10 +895,17 @@ impl EngineInner {
 
     // -- hydration --------------------------------------------------------
 
-    fn spawn_hydration_loop(&self, mut receiver: mpsc::UnboundedReceiver<String>) {
+    fn spawn_hydration_loop(&self, receiver: Arc<Mutex<mpsc::UnboundedReceiver<String>>>) {
         let hydrator = self.self_arc();
         let task = tokio::spawn(async move {
-            while let Some(path) = receiver.recv().await {
+            loop {
+                let path = {
+                    let mut rx = receiver.lock().await;
+                    rx.recv().await
+                };
+                let Some(path) = path else {
+                    break;
+                };
                 if hydrator.is_shutdown() {
                     break;
                 }
@@ -927,7 +990,20 @@ impl EngineInner {
     // -- local changes / uploads -----------------------------------------
 
     fn mark_local_change(&self, path: &str) -> Result<()> {
+        let canonical = config::normalize_icloud_path(path);
+        let path = canonical.as_str();
+        if path.contains(".local-conflict-") {
+            return Ok(());
+        }
         let meta = self.mirror.metadata(path)?;
+        // Directory mtime changes caused by hydration/content writes are not
+        // user changes. Child file events carry the real change.
+        if meta.is_dir()
+            && let Some(existing) = self.state.get_entry(path)?
+            && existing.remote_drivewsid.is_some()
+        {
+            return Ok(());
+        }
         let size = meta.len() as i64;
         let mtime = meta
             .modified()?
@@ -987,6 +1063,11 @@ impl EngineInner {
     }
 
     fn mark_local_delete(&self, path: &str) -> Result<()> {
+        let canonical = config::normalize_icloud_path(path);
+        let path = canonical.as_str();
+        if path.contains(".local-conflict-") {
+            return Ok(());
+        }
         if let Some(entry) = self.state.get_entry(path)? {
             if entry.remote_drivewsid.is_some() {
                 self.state.mark_tombstone(path)?;
@@ -1026,7 +1107,53 @@ impl EngineInner {
         if self.read_only() {
             return Err(Error::Auth("sign in before uploading changes".into()));
         }
+        // Stale rows from the old doubled-path crawl have no remote identity
+        // and must never be recreated on the cloud by the upload loop.
+        drop_stale_duplicates(&self.state, &self.mirror)?;
+        drop_orphan_ghost_files(&self.state, &self.mirror)?;
+        // Drop mtime-only "modify" operations for already-tracked directories.
+        // Hydration rewrites children and bumps parent mtimes; that is not a
+        // remote change and caused repeated conflict copies of whole folders.
+        let dir_modify_ops: Vec<(i64, String)> = self
+            .state
+            .list_pending_ops()?
+            .into_iter()
+            .filter(|op| op.op == "modify")
+            .filter_map(|op| {
+                self.state
+                    .get_entry(&op.path)
+                    .ok()
+                    .flatten()
+                    .filter(|entry| entry.is_dir() && entry.remote_drivewsid.is_some())
+                    .map(|_| (op.id, op.path))
+            })
+            .collect();
+        if !dir_modify_ops.is_empty() {
+            let now = chrono::Utc::now().timestamp();
+            for (id, path) in dir_modify_ops {
+                self.state.delete_op(id)?;
+                self.state.mark_clean(&path, now, None)?;
+            }
+        }
         let mut dirty = self.state.list_dirty()?;
+        // Conflict copies are local-only by design. They must never be
+        // uploaded, and their stale queued operations must not be retried.
+        let conflict_paths: Vec<String> = self
+            .state
+            .list_entries()?
+            .into_iter()
+            .filter(|entry| entry.path.contains(".local-conflict-"))
+            .map(|entry| entry.path)
+            .collect();
+        if !conflict_paths.is_empty() {
+            self.state.clear_all_conflict_pending()?;
+            let now = chrono::Utc::now().timestamp();
+            for path in conflict_paths {
+                self.state.clear_pending_subtree(&path)?;
+                self.state.mark_clean(&path, now, None)?;
+            }
+            dirty.retain(|entry| !entry.path.contains(".local-conflict-"));
+        }
         if dirty.is_empty() {
             return Ok(());
         }
@@ -1113,12 +1240,36 @@ impl EngineInner {
             .or_else(|| response.get("clientId"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        // `createFolders` returns only a drivewsid. The Python reference
+        // refreshes the child meta right after mkdir because an upload into
+        // the new folder must chain to its docwsid, not its drivewsid.
+        let mut doc_id = response
+            .get("docwsid")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut zone = response
+            .get("zone")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(id) = id.as_deref()
+            && doc_id.is_none()
+        {
+            match self.api.retrieve_node(id, None).await {
+                Ok(node) => {
+                    doc_id = node.docwsid.clone();
+                    if zone.is_none() {
+                        zone = node.zone.clone();
+                    }
+                }
+                Err(error) => warn!("could not refresh new folder {}: {error}", entry.path),
+            }
+        }
         self.state.update_remote_fields(
             &entry.path,
             id.as_deref(),
+            doc_id.as_deref(),
             None,
-            None,
-            Some("com.apple.CloudDocs"),
+            Some(zone.as_deref().unwrap_or(CLOUD_DOCS_ZONE)),
         )?;
         Ok(())
     }
@@ -1128,7 +1279,9 @@ impl EngineInner {
             self.state.mark_tombstone(&entry.path)?;
             return Ok(());
         }
-        let parent_id = self.remote_id_for_path(&parent_path(&entry.path)).await?;
+        let parent_folder = parent_path(&entry.path);
+        let parent_drivewsid = self.remote_id_for_path(&parent_folder).await?;
+        let (parent_doc_id, zone) = self.remote_doc_id_for_path(&parent_folder)?;
         let name = basename(&entry.path);
         if entry.remote_drivewsid.is_some() {
             self.sync_move_or_rename(entry).await?;
@@ -1142,12 +1295,49 @@ impl EngineInner {
         let content = std::fs::read(self.mirror.local_path(&entry.path)?)?;
         let response = self
             .api
-            .upload(&parent_id, &name, content, entry.mtime)
+            .upload(&parent_doc_id, &zone, &name, content, entry.mtime)
             .await?;
-        if let Some(id) = response.get("drivewsid").and_then(Value::as_str) {
-            self.state
-                .update_remote_fields(&entry.path, Some(id), None, None, None)?;
+        // The update response has no drivewsid: Python re-reads the parent's
+        // children after an upload to record the new node's remote identity.
+        let mut drivewsid = None;
+        let mut docwsid = None;
+        let mut etag = None;
+        let mut remote_zone = None;
+        match self.api.retrieve_node(&parent_drivewsid, None).await {
+            Ok(parent) => {
+                if let Some(child) = parent
+                    .items
+                    .as_ref()
+                    .and_then(|items| items.iter().find(|node| node.display_name() == name))
+                {
+                    drivewsid = Some(child.drivewsid.clone());
+                    docwsid = child.docwsid.clone();
+                    etag = child.etag.clone();
+                    remote_zone = child.zone.clone();
+                }
+            }
+            Err(error) => warn!("could not refresh uploaded file {}: {error}", entry.path),
         }
+        // If the crawl has not caught up yet, fall back to the nested document
+        // in the update response so the row never stays identity-less.
+        if docwsid.is_none()
+            && let Some(uploaded) = uploaded_document(&response)
+        {
+            docwsid = Some(uploaded.docwsid.clone());
+            etag = etag.or(uploaded.etag);
+            let cloud_docs = uploaded.zone.as_deref().unwrap_or(CLOUD_DOCS_ZONE) == CLOUD_DOCS_ZONE;
+            remote_zone = remote_zone.or(uploaded.zone);
+            if drivewsid.is_none() && cloud_docs {
+                drivewsid = Some(format!("FILE::{CLOUD_DOCS_ZONE}::{}", uploaded.docwsid));
+            }
+        }
+        self.state.update_remote_fields(
+            &entry.path,
+            drivewsid.as_deref(),
+            docwsid.as_deref(),
+            etag.as_deref(),
+            remote_zone.as_deref(),
+        )?;
         Ok(())
     }
 
@@ -1187,6 +1377,85 @@ impl EngineInner {
         Err(Error::other(format!(
             "remote parent for {path} is not uploaded yet"
         )))
+    }
+
+    /// Parent identity used by `/update/documents` when adding a file.
+    ///
+    /// The drivewsid (`FOLDER::com.apple.CloudDocs::…`) is for drivews
+    /// operations (create/move/delete); the document service chains a new
+    /// file to its parent by **docwsid** (a bare UUID, or `root`). Passing a
+    /// drivewsid here is what makes Apple answer HTTP 412
+    /// `VALIDATING_REFERENCE_ERROR` ("parents were missing").
+    fn remote_doc_id_for_path(&self, path: &str) -> Result<(String, String)> {
+        let entry = self.state.get_entry(path)?;
+        let drivewsid = entry
+            .as_ref()
+            .and_then(|entry| entry.remote_drivewsid.clone())
+            .or_else(|| (path == "/").then(|| ROOT_DRIVEWSID.to_string()));
+        let Some(drivewsid) = drivewsid else {
+            self.state.queue_op("create", path, None)?;
+            return Err(Error::other(format!(
+                "remote parent for {path} is not uploaded yet"
+            )));
+        };
+        let docwsid = entry
+            .as_ref()
+            .and_then(|entry| entry.remote_docwsid.clone())
+            .or_else(|| docwsid_from_drivewsid(&drivewsid))
+            .or_else(|| (path == "/").then(|| ROOT_DOCWSID.to_string()))
+            .ok_or_else(|| Error::other(format!("remote parent for {path} has no document id")))?;
+        let zone = entry
+            .as_ref()
+            .and_then(|entry| entry.remote_zone.clone())
+            .unwrap_or_else(|| CLOUD_DOCS_ZONE.to_string());
+        Ok((docwsid, zone))
+    }
+
+    /// A watcher event for an empty local directory with no remote node and
+    /// no dirty DB entry is a ghost; creating a row for it would resurrect it.
+    fn is_ignorable_empty_ghost(&self, relative: &str) -> bool {
+        let Some(view) = self.remote_view.lock().unwrap().clone() else {
+            return false;
+        };
+        let path = if relative.starts_with('/') {
+            relative.to_string()
+        } else {
+            format!("/{relative}")
+        };
+        if view.paths.contains(&path) || path.contains(".local-conflict-") {
+            return false;
+        }
+        if matches!(self.state.get_entry(&path), Ok(Some(entry)) if entry.dirty || entry.tombstone)
+        {
+            return false;
+        }
+        let Ok(local) = self.mirror.local_path(relative) else {
+            return false;
+        };
+        local.is_dir()
+            && fs::read_dir(local)
+                .map(|mut children| children.next().is_none())
+                .unwrap_or(false)
+    }
+
+    /// Whether a directory still contains a child shaped like `<name>/<name>`.
+    /// Such a child may hold real content that reconciliation refused to drop.
+    fn has_duplicate_child(&self, path: &str) -> bool {
+        let Ok(local) = self.mirror.local_path(path) else {
+            return false;
+        };
+        let Ok(children) = fs::read_dir(local) else {
+            return false;
+        };
+        for child in children.flatten() {
+            if child.path().is_dir() {
+                let name = child.file_name().to_string_lossy().into_owned();
+                if is_duplicate_shape(&join_path(path, &name)) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn reconcile_cache(&self) -> Result<()> {
@@ -1305,6 +1574,445 @@ impl EngineInner {
     }
 }
 
+/// Walk the remote tree and build canonical paths in one place.
+///
+/// Only `root`'s children are mirrored: Apple already lists the user's app
+/// libraries there (Pages, etc.), while `app_libraries()` is a catalogue of
+/// every app container on the account. The root is the only node mapped to
+/// `/`, and every other node contributes exactly one sanitized component.
+/// Walk the remote tree, fetching node details for folders whose children were
+/// not inlined. Apple's root response lists folders with `items: null`; without
+/// `retrieveItemDetailsInFolders` the crawl sees zero files.
+async fn collect_remote_nodes(
+    api: &ICloudApi,
+    root: RemoteNode,
+    allowed: impl Fn(&str) -> bool,
+) -> Result<(Vec<(String, RemoteNode)>, HashMap<String, String>)> {
+    let mut queue = vec![("/".to_string(), root, true)];
+    let mut visited = HashSet::new();
+    let mut nodes = Vec::new();
+    let mut id_paths = HashMap::new();
+    while let Some((parent, mut node, is_root)) = queue.pop() {
+        if !visited.insert(node.drivewsid.clone()) {
+            continue;
+        }
+        let path = if is_root {
+            "/".to_string()
+        } else {
+            join_path(&parent, &node.display_name())
+        };
+        // The root is the crawl entry point; an allowlist of real folders
+        // must not prevent us from enumerating its children.
+        if !is_root
+            && (path == "/TRASH_ROOT" || path.starts_with("/TRASH_ROOT/") || !allowed(&path))
+        {
+            continue;
+        }
+        id_paths.insert(node.drivewsid.clone(), path.clone());
+
+        let mut children = node.items.clone().unwrap_or_default();
+        if !is_root && node.is_dir() && children.is_empty() {
+            match api
+                .retrieve_node(&node.drivewsid, node.share_id.as_ref())
+                .await
+            {
+                Ok(detail) => {
+                    children = detail.items.clone().unwrap_or_default();
+                    if node.etag.is_none() {
+                        node.etag = detail.etag;
+                    }
+                    if node.size == 0 {
+                        node.size = detail.size;
+                    }
+                    if node.date_changed.is_none() {
+                        node.date_changed = detail.date_changed;
+                    }
+                }
+                Err(error) => {
+                    debug!("could not list children of {path}: {error}");
+                }
+            }
+        }
+        for child in children {
+            queue.push((path.clone(), child, false));
+        }
+        nodes.push((path, node));
+    }
+    Ok((nodes, id_paths))
+}
+
+/// Synchronous test-only walker for inlined node trees.
+#[cfg(test)]
+fn walk_remote_nodes(
+    root: RemoteNode,
+    allowed: impl Fn(&str) -> bool,
+) -> (Vec<(String, RemoteNode)>, HashMap<String, String>) {
+    let mut queue = vec![("/".to_string(), root, true)];
+    let mut visited = HashSet::new();
+    let mut nodes = Vec::new();
+    let mut id_paths = HashMap::new();
+    while let Some((parent, node, is_root)) = queue.pop() {
+        if !visited.insert(node.drivewsid.clone()) {
+            continue;
+        }
+        let path = if is_root {
+            "/".to_string()
+        } else {
+            join_path(&parent, &node.display_name())
+        };
+        if !is_root
+            && (path == "/TRASH_ROOT" || path.starts_with("/TRASH_ROOT/") || !allowed(&path))
+        {
+            continue;
+        }
+        id_paths.insert(node.drivewsid.clone(), path.clone());
+        for child in node.items.clone().unwrap_or_default() {
+            queue.push((path.clone(), child, false));
+        }
+        nodes.push((path, node));
+    }
+    (nodes, id_paths)
+}
+
+/// `path` is `canonical` followed by one or more repeats of its own basename.
+/// This is the signature of the old `/Parent/Parent` build.
+fn is_duplicate_path(path: &str, canonical: &str) -> bool {
+    if canonical == "/" || !path.starts_with(canonical) {
+        return false;
+    }
+    let rest = &path[canonical.len()..];
+    if !rest.starts_with('/') {
+        return false;
+    }
+    let leaf = canonical
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    if leaf.is_empty() {
+        return false;
+    }
+    rest.split('/')
+        .filter(|part| !part.is_empty())
+        .all(|part| part == leaf)
+}
+
+/// A path whose final component repeats an ancestor component, e.g.
+/// `/Instagram/Instagram` or `/FOLDER::X/FOLDER::X`.
+fn is_duplicate_shape(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let Some(last) = parts.last().copied() else {
+        return false;
+    };
+    parts.len() > 1 && parts[..parts.len() - 1].contains(&last)
+}
+
+/// Any file anywhere under `path` means there may be user data: leave it.
+fn dir_has_file(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            if dir_has_file(&child) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Outer DB paths for stale duplicates created by the bad path build.
+///
+/// A candidate is a duplicate-shaped directory with no remote identity and no
+/// file entries in its subtree. Its parent is included when it is also a
+/// remote-less directory whose subtree is directories only — that is the
+/// top-level app-library folder the bad crawl created. Entries with a real
+/// remote id are never candidates.
+fn stale_duplicate_paths(state: &Database) -> Result<Vec<String>> {
+    let entries = state.list_entries()?;
+    let mut candidates = HashSet::new();
+    for entry in &entries {
+        if !is_duplicate_shape(&entry.path) || !entry.is_dir() || entry.remote_drivewsid.is_some() {
+            continue;
+        }
+        if state
+            .list_subtree(&entry.path)?
+            .iter()
+            .any(|child| !child.is_dir())
+        {
+            continue;
+        }
+        let parent = parent_path(&entry.path);
+        let parent_ok = match entries.iter().find(|item| item.path == parent) {
+            Some(item) => {
+                item.is_dir()
+                    && item.remote_drivewsid.is_none()
+                    && state
+                        .list_subtree(&parent)?
+                        .iter()
+                        .all(|child| child.is_dir())
+            }
+            None => true,
+        };
+        candidates.insert(if parent_ok {
+            parent
+        } else {
+            entry.path.clone()
+        });
+    }
+    // Keep outermost paths so subtrees never overlap.
+    let mut sorted: Vec<String> = candidates.into_iter().collect();
+    sorted.sort_by_key(|path| path.len());
+    let mut outermost = Vec::new();
+    for path in sorted {
+        if outermost
+            .iter()
+            .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+        {
+            continue;
+        }
+        outermost.push(path);
+    }
+    Ok(outermost)
+}
+
+/// Drop stale duplicate rows (and their pending ops) before they reach the
+/// upload loop. Local directories are left alone; a path containing any file
+/// is left in place. Returns the number of DB entries removed.
+fn drop_stale_duplicates(state: &Database, mirror: &Mirror) -> Result<usize> {
+    let mut dropped = 0usize;
+    for path in stale_duplicate_paths(state)? {
+        if let Ok(local) = mirror.local_path(&path)
+            && dir_has_file(&local)
+        {
+            continue;
+        }
+        dropped += state.list_subtree(&path)?.len();
+        state.remove_subtree(&path)?;
+    }
+    if dropped > 0 {
+        info!("dropped {dropped} stale duplicate entries");
+    }
+    Ok(dropped)
+}
+
+/// A CloudDocs drivewsid is `FOLDER::com.apple.CloudDocs::<docwsid>` (or
+/// `FILE::…`); the last segment is the docwsid the document service uses.
+fn docwsid_from_drivewsid(drivewsid: &str) -> Option<String> {
+    let id = drivewsid
+        .strip_prefix("FOLDER::com.apple.CloudDocs::")
+        .or_else(|| drivewsid.strip_prefix("FILE::com.apple.CloudDocs::"))?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Drop DB rows for local-only ghost files that cannot be uploaded: dirty
+/// file rows with no remote id whose local file no longer exists. Empty files
+/// are legitimate (Apple accepts zero-byte uploads), so they stay. No local
+/// file is ever deleted here. This stops endless "remote parent … is not
+/// uploaded yet" warnings from rows that no longer have content at all.
+fn drop_orphan_ghost_files(state: &Database, mirror: &Mirror) -> Result<usize> {
+    let mut dropped = 0usize;
+    for entry in state.list_entries()? {
+        if entry.path == "/" || entry.is_dir() || entry.tombstone {
+            continue;
+        }
+        if entry.remote_drivewsid.is_some() || entry.remote_docwsid.is_some() {
+            continue;
+        }
+        let Ok(local) = mirror.local_path(&entry.path) else {
+            continue;
+        };
+        if local.exists() {
+            continue;
+        }
+        dropped += state.list_subtree(&entry.path)?.len();
+        state.remove_subtree(&entry.path)?;
+    }
+    if dropped > 0 {
+        info!("dropped {dropped} local-only ghost file entries");
+    }
+    Ok(dropped)
+}
+
+/// Drop DB rows (and pending ops) absent from the authoritative remote
+/// view. Only clean paths with no real file content are removed; dirty
+/// entries, conflict copies and files stay. Empty local directories for
+/// those paths are removed with `remove_dir` (never recursively).
+fn purge_stale_entries(state: &Database, mirror: &Mirror, view: &RemoteView) -> Result<usize> {
+    let mut stale = Vec::new();
+    for entry in state.list_entries()? {
+        if entry.path == "/" || view.paths.contains(&entry.path) {
+            continue;
+        }
+        // Legacy watcher rows without a leading slash were created by the
+        // path-normalization bug. They are never real remote nodes; drop them
+        // only when they contain no real file content.
+        if !entry.path.starts_with('/') {
+            if entry.remote_drivewsid.is_none() {
+                if let Ok(local) = mirror.local_path(&entry.path)
+                    && dir_has_file(&local)
+                {
+                    continue;
+                }
+                stale.push(entry.path);
+            }
+            continue;
+        }
+        // Conflict copies are local-only. Drop DB rows for conflicts whose
+        // local copy no longer exists; keep any conflict that still has data.
+        if entry.path.contains(".local-conflict-") {
+            if let Ok(local) = mirror.local_path(&entry.path)
+                && (local.exists() || dir_has_file(&local))
+            {
+                continue;
+            }
+            stale.push(entry.path);
+            continue;
+        }
+        if entry.dirty || entry.tombstone {
+            continue;
+        }
+        // A clean entry whose id is still remote was moved; let the normal
+        // rename logic reconcile it instead of dropping the row.
+        if entry
+            .remote_drivewsid
+            .as_deref()
+            .is_some_and(|id| view.ids.contains(id))
+        {
+            continue;
+        }
+        // Never drop an ancestor of a mirrored path.
+        if view
+            .paths
+            .iter()
+            .any(|path| path.starts_with(&format!("{}/", entry.path)))
+        {
+            continue;
+        }
+        if let Ok(local) = mirror.local_path(&entry.path)
+            && dir_has_file(&local)
+        {
+            continue;
+        }
+        stale.push(entry.path);
+    }
+    let mut removed = 0usize;
+    for path in stale {
+        removed += state.list_subtree(&path)?.len();
+        state.remove_subtree(&path)?;
+        if let Ok(local) = mirror.local_path(&path)
+            && local.is_dir()
+        {
+            let _ = fs::remove_dir(&local);
+        }
+    }
+    remove_empty_ghost_dirs(state, mirror, view)?;
+    if removed > 0 {
+        info!("purged {removed} stale entries absent from iCloud");
+    }
+    Ok(removed)
+}
+
+/// Remove empty local directories that no remote node accounts for.
+/// Processed deepest-first so a nested ghost does not shield its parent.
+fn remove_empty_ghost_dirs(state: &Database, mirror: &Mirror, view: &RemoteView) -> Result<()> {
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let root = mirror.root();
+    let mut dirs = Vec::new();
+    collect(&root, &mut dirs);
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in dirs {
+        let Ok(relative) = dir.strip_prefix(&root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.is_empty() {
+            continue;
+        }
+        let path = format!("/{relative}");
+        if view.paths.contains(&path) || path.contains(".local-conflict-") {
+            continue;
+        }
+        if matches!(state.get_entry(&path), Ok(Some(entry)) if entry.dirty || entry.tombstone) {
+            continue;
+        }
+        let Ok(mut children) = fs::read_dir(&dir) else {
+            continue;
+        };
+        if children.next().is_none() {
+            let _ = fs::remove_dir(&dir);
+        }
+    }
+    Ok(())
+}
+
+/// Remove only duplicate directories that the DB and filesystem both prove
+/// were created by the bad path: clean, empty, no recorded children and no
+/// current remote entry at that path. Files and non-empty directories are
+/// always left alone.
+fn reconcile_bad_paths(
+    state: &Database,
+    mirror: &Mirror,
+    id_paths: &HashMap<String, String>,
+    snapshot: &HashMap<String, RemoteNode>,
+) -> Result<()> {
+    for entry in state.list_entries()? {
+        if snapshot.contains_key(&entry.path) || !entry.is_dir() || entry.dirty || entry.tombstone {
+            continue;
+        }
+        let mapped = entry
+            .remote_drivewsid
+            .as_deref()
+            .and_then(|id| id_paths.get(id).map(String::as_str));
+        // The current crawl still maps this id to exactly this path.
+        if mapped == Some(entry.path.as_str()) {
+            continue;
+        }
+        let duplicate = mapped.is_some_and(|canonical| is_duplicate_path(&entry.path, canonical))
+            || is_duplicate_shape(&entry.path);
+        if !duplicate {
+            continue;
+        }
+        // DB proof: nothing is recorded below the duplicate and it is clean.
+        if state.list_subtree(&entry.path)?.len() != 1 {
+            continue;
+        }
+        // Filesystem proof: either an empty directory or no directory at all
+        // (the user may already have deleted it locally). A plain `remove_dir`
+        // can never delete a file, and a path holding a file is left alone.
+        let local = match mirror.local_path(&entry.path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if local.is_dir() {
+            let mut children = match fs::read_dir(&local) {
+                Ok(children) => children,
+                Err(_) => continue,
+            };
+            if children.next().is_some() || fs::remove_dir(&local).is_err() {
+                continue;
+            }
+        } else if local.exists() {
+            continue;
+        }
+        state.remove_subtree(&entry.path)?;
+    }
+    Ok(())
+}
+
 fn owner_from_shareid(share_id: &str) -> Option<String> {
     serde_json::from_str::<Value>(share_id)
         .ok()
@@ -1321,12 +2029,31 @@ fn owner_from_shareid(share_id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::normalize_icloud_path;
+    use crate::testutil::TempDir;
 
     #[test]
     fn path_helpers() {
         assert_eq!(join_path("/", "Photos"), "/Photos");
         assert_eq!(parent_path("/Photos/one.jpg"), "/Photos");
         assert_eq!(normalize_icloud_path("/a/../b"), "/b");
+    }
+
+    #[test]
+    fn docwsid_is_last_component_of_a_cloud_docs_drivewsid() {
+        assert_eq!(
+            docwsid_from_drivewsid(ROOT_DRIVEWSID).as_deref(),
+            Some(ROOT_DOCWSID)
+        );
+        assert_eq!(
+            docwsid_from_drivewsid("FOLDER::com.apple.CloudDocs::BAA2B1DA").as_deref(),
+            Some("BAA2B1DA")
+        );
+        assert_eq!(
+            docwsid_from_drivewsid("FILE::com.apple.CloudDocs::9EDA025E").as_deref(),
+            Some("9EDA025E")
+        );
+        // Non-CloudDocs ids must not be guessed: they belong to app libraries.
+        assert_eq!(docwsid_from_drivewsid("FOLDER::other::documents"), None);
     }
 
     #[test]
@@ -1350,6 +2077,409 @@ mod tests {
         signal.scheduled(15);
         let next = signal.next().unwrap();
         assert!(next >= now + 14 && next <= now + 16);
+    }
+
+    fn clean_dir(path: &str, id: &str) -> Entry {
+        Entry {
+            path: path.into(),
+            entry_type: "folder".into(),
+            parent_path: parent_path(path),
+            remote_drivewsid: Some(id.into()),
+            remote_docwsid: None,
+            remote_etag: None,
+            remote_zone: None,
+            remote_shareid: None,
+            size: 0,
+            mtime: 0,
+            hydrated: true,
+            dirty: false,
+            tombstone: false,
+            local_sha256: None,
+            last_synced_at: Some(1),
+            synced_path: Some(path.into()),
+        }
+    }
+
+    fn dirty_dir(path: &str, id: Option<&str>) -> Entry {
+        Entry {
+            path: path.into(),
+            entry_type: "folder".into(),
+            parent_path: parent_path(path),
+            remote_drivewsid: id.map(str::to_string),
+            remote_docwsid: None,
+            remote_etag: None,
+            remote_zone: None,
+            remote_shareid: None,
+            size: 0,
+            mtime: 0,
+            hydrated: true,
+            dirty: true,
+            tombstone: false,
+            local_sha256: None,
+            last_synced_at: None,
+            synced_path: None,
+        }
+    }
+
+    fn dir_entry(path: &str, id: Option<&str>, dirty: bool) -> Entry {
+        let mut entry = dirty_dir(path, id);
+        entry.dirty = dirty;
+        entry.synced_path = (!dirty).then(|| path.to_string());
+        entry
+    }
+
+    #[test]
+    fn allowlist_snapshot_purges_ghosts_and_keeps_real_roots() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+
+        let mut config = Config::load_defaults();
+        config.sync_paths = vec!["/Docs".into(), "/Downloads".into()];
+        let root = RemoteNode::from_value(&json!({
+            "name": "",
+            "type": "folder",
+            "drivewsid": ROOT_DRIVEWSID,
+            "items": [
+                {"name":"Docs","type":"folder","drivewsid":"FOLDER::docs"},
+                {"name":"Downloads","type":"folder","drivewsid":"FOLDER::downloads"},
+                {"name":"Dropbox","type":"folder","drivewsid":"FOLDER::dropbox"},
+                {"name":"Pages","type":"app_library","drivewsid":"FOLDER::com.apple.Pages::documents"},
+                {"name":"Alibaba","type":"folder","drivewsid":"FOLDER::alibaba"},
+                {"name":"FOLDER::com","type":"folder","drivewsid":"FOLDER::com"}
+            ]
+        }));
+        let (nodes, _) = walk_remote_nodes(root, |path| config.path_allowed(path));
+        let snapshot: HashMap<String, RemoteNode> = nodes.into_iter().collect();
+        let view = RemoteView {
+            paths: snapshot.keys().cloned().collect(),
+            ids: snapshot
+                .values()
+                .map(|node| node.drivewsid.clone())
+                .collect(),
+        };
+        let mut paths: Vec<&str> = view.paths.iter().map(String::as_str).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/", "/Docs", "/Downloads"]);
+
+        // Stale DB rows/local folders outside the allowlist.
+        for path in [
+            "/Docs",
+            "/Downloads",
+            "/Dropbox",
+            "/Pages",
+            "/Alibaba",
+            "/FOLDER::com",
+            "/Instagram",
+            "/Instagram/Instagram",
+            "/Work Chat",
+            "/Docs.local-conflict-20261123000000",
+        ] {
+            let id = match path {
+                "/Docs" => Some("FOLDER::docs"),
+                "/Downloads" => Some("FOLDER::downloads"),
+                _ => None,
+            };
+            db.upsert_entry(&dir_entry(path, id, false)).unwrap();
+            mirror.ensure_dir(path).unwrap();
+        }
+        // A directory with real content and a conflict copy must survive.
+        mirror
+            .write_all("/Work Chat/keep.txt", b"precious")
+            .unwrap();
+        // A purely local empty ghost with no DB row at all.
+        mirror.ensure_dir("/Ghost").unwrap();
+
+        let removed = purge_stale_entries(&db, &mirror, &view).unwrap();
+        assert!(removed > 0);
+
+        assert!(db.get_entry("/Docs").unwrap().is_some());
+        assert!(db.get_entry("/Downloads").unwrap().is_some());
+        assert!(mirror.exists("/Docs"));
+        assert!(mirror.exists("/Downloads"));
+        for path in [
+            "/Dropbox",
+            "/Pages",
+            "/Alibaba",
+            "/FOLDER::com",
+            "/Instagram",
+            "/Instagram/Instagram",
+            "/Ghost",
+        ] {
+            assert!(db.get_entry(path).unwrap().is_none(), "DB row for {path}");
+            assert!(!mirror.exists(path), "local folder {path} survived");
+        }
+        assert!(db.get_entry("/Work Chat").unwrap().is_some());
+        assert_eq!(
+            fs::read(mirror.local_path("/Work Chat/keep.txt").unwrap()).unwrap(),
+            b"precious"
+        );
+        assert!(
+            db.get_entry("/Docs.local-conflict-20261123000000")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_duplicate_rows_are_dropped_before_upload() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+
+        // Exactly the shape left by the bad crawl: the bogus top-level app
+        // library folder and its doubled child, both dirty with no remote id.
+        db.upsert_entry(&dirty_dir("/Instagram", None)).unwrap();
+        db.upsert_entry(&dirty_dir("/Instagram/Instagram", None))
+            .unwrap();
+        db.queue_op("create", "/Instagram", None).unwrap();
+        db.queue_op("create", "/Instagram/Instagram", None).unwrap();
+        db.upsert_entry(&clean_dir("/Docs", "FOLDER::docs"))
+            .unwrap();
+
+        // The user already removed the local directories; DB rows are stale.
+        let dropped = drop_stale_duplicates(&db, &mirror).unwrap();
+        assert_eq!(dropped, 2);
+        assert!(db.get_entry("/Instagram").unwrap().is_none());
+        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_none());
+        assert!(db.list_pending_ops().unwrap().is_empty());
+        assert!(db.list_dirty().unwrap().is_empty());
+        assert!(db.get_entry("/Docs").unwrap().is_some());
+    }
+
+    fn dirty_file(path: &str, id: Option<&str>) -> Entry {
+        let mut entry = dirty_dir(path, id);
+        entry.entry_type = "file".into();
+        entry
+    }
+
+    #[test]
+    fn orphan_ghost_file_rows_are_dropped_without_touching_real_files() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+
+        // A vanished local file is a ghost; an empty file is a real upload.
+        db.upsert_entry(&dirty_file("/missing.txt", None)).unwrap();
+        db.upsert_entry(&dirty_file("/empty.txt", None)).unwrap();
+        mirror.write_all("/empty.txt", b"").unwrap();
+        db.queue_op("create", "/missing.txt", None).unwrap();
+        db.queue_op("create", "/empty.txt", None).unwrap();
+
+        // Real content is never dropped, even when the row is local-only.
+        db.upsert_entry(&dirty_file("/test/test.txt", None))
+            .unwrap();
+        mirror.write_all("/test/test.txt", b"lol\n").unwrap();
+        db.queue_op("modify", "/test/test.txt", None).unwrap();
+
+        // A row with a remote id is not a ghost; sync owns its lifecycle.
+        db.upsert_entry(&dirty_file("/remote.txt", Some("FILE::id")))
+            .unwrap();
+
+        assert_eq!(drop_orphan_ghost_files(&db, &mirror).unwrap(), 1);
+        assert!(db.get_entry("/missing.txt").unwrap().is_none());
+        assert!(db.get_entry("/empty.txt").unwrap().is_some());
+        assert!(db.get_entry("/test/test.txt").unwrap().is_some());
+        assert!(db.get_entry("/remote.txt").unwrap().is_some());
+        // Pending ops for dropped rows are gone; real ones stay.
+        let paths: Vec<String> = db
+            .list_pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|op| op.path)
+            .collect();
+        assert!(!paths.iter().any(|path| path == "/missing.txt"));
+        assert!(paths.iter().any(|path| path == "/empty.txt"));
+        assert!(paths.iter().any(|path| path == "/test/test.txt"));
+        assert_eq!(
+            fs::read(mirror.local_path("/empty.txt").unwrap()).unwrap(),
+            b""
+        );
+        assert_eq!(
+            fs::read(mirror.local_path("/test/test.txt").unwrap()).unwrap(),
+            b"lol\n"
+        );
+    }
+
+    #[test]
+    fn duplicate_with_real_remote_id_is_kept() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+        db.upsert_entry(&dirty_dir("/Instagram", Some("FOLDER::parent")))
+            .unwrap();
+        db.upsert_entry(&dirty_dir("/Instagram/Instagram", Some("FOLDER::real")))
+            .unwrap();
+        assert_eq!(drop_stale_duplicates(&db, &mirror).unwrap(), 0);
+        assert!(db.get_entry("/Instagram").unwrap().is_some());
+        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_some());
+    }
+
+    #[test]
+    fn duplicate_with_local_file_is_kept() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+        db.upsert_entry(&dirty_dir("/Instagram", None)).unwrap();
+        db.upsert_entry(&dirty_dir("/Instagram/Instagram", None))
+            .unwrap();
+        mirror.ensure_dir("/Instagram/Instagram").unwrap();
+        mirror
+            .write_all("/Instagram/Instagram/keep.txt", b"precious")
+            .unwrap();
+        assert_eq!(drop_stale_duplicates(&db, &mirror).unwrap(), 0);
+        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_some());
+        assert_eq!(
+            fs::read(mirror.local_path("/Instagram/Instagram/keep.txt").unwrap()).unwrap(),
+            b"precious"
+        );
+    }
+
+    #[test]
+    fn reconciliation_drops_duplicate_row_without_local_directory() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+        db.upsert_entry(&clean_dir("/Instagram/Instagram", "FOLDER::old"))
+            .unwrap();
+        let mut id_paths = HashMap::new();
+        id_paths.insert("FOLDER::old".to_string(), "/Instagram".to_string());
+        let snapshot = HashMap::new();
+        reconcile_bad_paths(&db, &mirror, &id_paths, &snapshot).unwrap();
+        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_none());
+    }
+
+    #[test]
+    fn crawl_only_mirrors_true_root_items_with_canonical_paths() {
+        // Shape observed live: root children include regular folders and app
+        // libraries, and some app-library `name` values are raw drivewsids.
+        let root = RemoteNode::from_value(&json!({
+            "name": "",
+            "type": "folder",
+            "drivewsid": ROOT_DRIVEWSID,
+            "items": [
+                {"name":"Docs","type":"folder","drivewsid":"FOLDER::docs"},
+                {"name":"Downloads","type":"folder","drivewsid":"FOLDER::downloads"},
+                {"name":"Dropbox","type":"folder","drivewsid":"FOLDER::dropbox"},
+                {"name":"Pages","type":"app_library","drivewsid":"FOLDER::com.apple.Pages::documents"},
+                {"name":"FOLDER::com.apple.TextInput::documents","type":"app_library","drivewsid":"FOLDER::com.apple.TextInput::documents"}
+            ]
+        }));
+        let (nodes, id_paths) = walk_remote_nodes(root, |_| true);
+        let paths: HashSet<&str> = nodes.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths.len(), 6);
+        for expected in [
+            "/",
+            "/Docs",
+            "/Downloads",
+            "/Dropbox",
+            "/Pages",
+            "/FOLDER::com.apple.TextInput::documents",
+        ] {
+            assert!(
+                paths.contains(expected),
+                "missing canonical path {expected}"
+            );
+        }
+        assert_eq!(
+            id_paths
+                .get("FOLDER::com.apple.Pages::documents")
+                .map(String::as_str),
+            Some("/Pages")
+        );
+    }
+
+    #[test]
+    fn embedded_path_names_are_reduced_to_one_component() {
+        let root = RemoteNode::from_value(&json!({
+            "name": "",
+            "type": "folder",
+            "drivewsid": ROOT_DRIVEWSID,
+            "items": [
+                {"name":"/Docs/Docs","type":"folder","drivewsid":"FOLDER::nested"},
+                {"name":"Full::Path::Name/Full::Path::Name","type":"app_library","drivewsid":"FOLDER::Full::Path::Name"}
+            ]
+        }));
+        let (nodes, _) = walk_remote_nodes(root, |_| true);
+        let paths: HashSet<&str> = nodes.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(paths.contains("/Docs"));
+        assert!(paths.contains("/Full::Path::Name"));
+        assert!(!paths.iter().any(|path| path.contains("Docs/Docs")));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.contains("Full::Path::Name/Full::Path::Name"))
+        );
+    }
+
+    #[test]
+    fn duplicate_path_signatures() {
+        assert!(is_duplicate_path("/Instagram/Instagram", "/Instagram"));
+        assert!(is_duplicate_path("/FOLDER::X/FOLDER::X", "/FOLDER::X"));
+        assert!(is_duplicate_path("/A/A/A", "/A"));
+        assert!(!is_duplicate_path("/Instagram/Photos", "/Instagram"));
+        assert!(!is_duplicate_path("/Instagram", "/Instagram"));
+        assert!(is_duplicate_shape("/Cloud Music/Cloud Music"));
+        assert!(!is_duplicate_shape("/Docs/Downloads"));
+    }
+
+    #[test]
+    fn reconciliation_removes_only_empty_db_proven_duplicates() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+        let bad_id = "FOLDER::iCloud.com.burbn.instagram::documents";
+        db.upsert_entry(&clean_dir("/Instagram/Instagram", bad_id))
+            .unwrap();
+        mirror.ensure_dir("/Instagram/Instagram").unwrap();
+        // A legitimate `/Docs/Docs` mapped to itself must not be touched.
+        db.upsert_entry(&clean_dir("/Docs/Docs", "FOLDER::real-docs-docs"))
+            .unwrap();
+        mirror.ensure_dir("/Docs/Docs").unwrap();
+
+        let mut id_paths = HashMap::new();
+        id_paths.insert(bad_id.to_string(), "/Instagram".to_string());
+        id_paths.insert(
+            "FOLDER::real-docs-docs".to_string(),
+            "/Docs/Docs".to_string(),
+        );
+        let snapshot = HashMap::new();
+        reconcile_bad_paths(&db, &mirror, &id_paths, &snapshot).unwrap();
+
+        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_none());
+        assert!(!mirror.exists("/Instagram/Instagram"));
+        assert!(db.get_entry("/Docs/Docs").unwrap().is_some());
+        assert!(mirror.exists("/Docs/Docs"));
+    }
+
+    #[test]
+    fn reconciliation_leaves_duplicate_with_content() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
+        let bad_id = "FOLDER::iCloud.com.sevenam.CloudMusic::documents";
+        db.upsert_entry(&clean_dir("/Cloud Music/Cloud Music", bad_id))
+            .unwrap();
+        mirror.ensure_dir("/Cloud Music/Cloud Music").unwrap();
+        mirror
+            .write_all("/Cloud Music/Cloud Music/keep.txt", b"precious")
+            .unwrap();
+
+        let mut id_paths = HashMap::new();
+        id_paths.insert(bad_id.to_string(), "/Cloud Music".to_string());
+        let snapshot = HashMap::new();
+        reconcile_bad_paths(&db, &mirror, &id_paths, &snapshot).unwrap();
+
+        assert!(db.get_entry("/Cloud Music/Cloud Music").unwrap().is_some());
+        assert_eq!(
+            fs::read(
+                mirror
+                    .local_path("/Cloud Music/Cloud Music/keep.txt")
+                    .unwrap()
+            )
+            .unwrap(),
+            b"precious"
+        );
     }
 
     #[tokio::test]

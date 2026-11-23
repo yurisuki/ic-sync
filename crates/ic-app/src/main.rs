@@ -13,6 +13,10 @@ use ui::App;
 ///
 /// Missing or unreadable config keeps the safe default (start minimized).
 fn start_minimized() -> bool {
+    // Autostart entries launch us with `--minimized`.
+    if std::env::args().any(|arg| arg == "--minimized") {
+        return true;
+    }
     let Ok(path) = ic_core::paths::config_file() else {
         return true;
     };
@@ -39,8 +43,32 @@ fn main() -> iced::Result {
         .expect("failed to spawn Tokio runtime thread");
     tracing::info!("Core worker started");
 
-    let icon = icons::load().window_icon();
-    let window = iced::window::Settings {
+    // IC-SYNC runs as a daemon with no initial window. On Wayland, winit cannot
+    // hide a window (`set_visible` is a no-op) and compositors such as Hyprland
+    // may ignore `xdg_toplevel.set_minimized`. Creating no window at startup is
+    // the only reliable way to stay alive in the tray; the GUI opens a window
+    // when the tray asks for one, and destroys just that window on close.
+    iced::daemon(ui::new, App::update, daemon_view)
+        .title(daemon_title)
+        .theme(daemon_theme)
+        .subscription(ui::subscription)
+        .run()
+}
+
+fn daemon_view<'a>(app: &'a App, _window: iced::window::Id) -> iced::Element<'a, ui::Message> {
+    App::view(app)
+}
+
+fn daemon_title(app: &App, _window: iced::window::Id) -> String {
+    ui::title(app)
+}
+
+fn daemon_theme(app: &App, _window: iced::window::Id) -> iced::Theme {
+    ui::theme(app)
+}
+
+pub(crate) fn window_settings() -> iced::window::Settings {
+    iced::window::Settings {
         size: iced::Size {
             width: 1060.0,
             height: 760.0,
@@ -49,26 +77,17 @@ fn main() -> iced::Result {
             width: 780.0,
             height: 580.0,
         }),
-        // The tray thread is already running when Iced boots. A hidden initial
-        // window still receives `window::latest()`, so "Open IC-SYNC" can show
-        // and focus it later via `window::set_mode(Windowed)`.
-        visible: !start_minimized(),
-        icon,
+        icon: icons::load().window_icon(),
         ..Default::default()
-    };
-
-    iced::application(ui::new, App::update, App::view)
-        .exit_on_close_request(false)
-        .title(ui::title)
-        .theme(ui::theme)
-        .subscription(ui::subscription)
-        .window(window)
-        .run()
+    }
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ic_app=info,ic_core=info,warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,wgpu_hal=error,wgpu_core=error,iced_wgpu=error,iced_winit=error,ic_app=info,ic_core=info",
+        )
+    });
 
     // Logging to stderr keeps credentials out of files by construction. The
     // core crate configures its own rotating log for engine diagnostics.

@@ -28,6 +28,10 @@ pub enum Error {
     Auth(String),
     #[error("two-factor authentication required: {0}")]
     TwoFactor(String),
+    /// A verification code was rejected by Apple (e.g. `-21669`). The
+    /// challenge is still alive and the caller may retry or switch methods.
+    #[error("verification code rejected: {0}")]
+    CodeRejected(String),
     #[error("offline: {0}")]
     Offline(String),
     #[error("conflict: {0}")]
@@ -75,6 +79,10 @@ impl Error {
         Self::Credential(message.into())
     }
 
+    pub fn code_rejected(message: impl Into<String>) -> Self {
+        Self::CodeRejected(message.into())
+    }
+
     /// True for failures that mean "try again later", not "ask the user to log in".
     pub fn is_offline(&self) -> bool {
         matches!(self, Self::Offline(_) | Self::Http(_))
@@ -82,6 +90,13 @@ impl Error {
 
     /// True for failures that require interactive sign-in / 2FA.
     pub fn is_auth(&self) -> bool {
-        matches!(self, Self::Auth(_) | Self::TwoFactor(_))
+        matches!(
+            self,
+            Self::Auth(_) | Self::TwoFactor(_) | Self::CodeRejected(_)
+        )
+    }
+
+    pub fn is_code_rejected(&self) -> bool {
+        matches!(self, Self::CodeRejected(_))
     }
 }

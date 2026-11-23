@@ -74,23 +74,31 @@ migrated secret is invalid.
 1. Enter your **Apple ID** (email) and **password**.
 2. Optionally check **Accept terms** if this account has not accepted Apple's
    current iCloud terms.
-3. Optionally check **Force SMS** if you want a text message code even when a
-   trusted device is available.
-4. Click **Sign in**. Trust tokens are handled automatically; there is no
-   manual trust-token field in the normal sign-in flow.
+3. Click **Sign in**. If 2FA is required, choose a **Verification method** and
+   enter the matching code — see
+   [Two-factor authentication](#3-two-factor-authentication-2fa). Trust and
+   session tokens are handled automatically; there is no manual token field in
+   the normal sign-in flow.
 
 ## 3. Two-factor authentication (2FA)
 
-Most Apple IDs require 2FA. After the password step, the **2FA code** field
-appears.
+Most Apple IDs require 2FA. After the password step, choose a **Verification
+method** and enter the 6-digit code for that method:
 
-- **Trusted device:** choose this when one of your devices can display a
-  6-digit code; enter the code shown there.
-- **SMS / voice:** choose **Force SMS** (or select SMS when prompted) and enter
-  the code sent to your trusted phone number. Voice calls are available for
-  some regions/carriers.
-- **Trust token:** IC-SYNC obtains and stores the trust token automatically
-  after a successful sign-in and reuses it on future sign-ins, so there is
+1. **iPhone / trusted device (recommended)** — the first option in the selector.
+   Enter the code shown on one of your trusted Apple devices.
+2. **SMS to trusted number** — the second option. Enter the code texted to your
+   trusted phone number.
+
+**The code must match the verification method you selected.** A code delivered
+by SMS will not verify a trusted-device prompt, and vice versa. If Apple
+rejects the code with error **`-21669`**, switch to the other method and enter
+the code you received for *that* method (for example, switch to SMS and use the
+text-message code). If you had a trusted-device code, request a fresh one after
+switching.
+
+- **Trust / session tokens:** IC-SYNC obtains and stores them automatically
+  after a successful sign-in and reuses them on future sign-ins, so there is
   nothing to copy or paste in the normal flow. You may still be asked for a
   code occasionally. Accounts that use security keys may need advanced
   handling outside the standard sign-in UI.
@@ -109,6 +117,11 @@ Open **Settings → Sync folder** and use the native folder picker to choose a
 local directory. This folder is where iCloud Drive files are mirrored as
 **real files**, not placeholders backed by a virtual filesystem.
 
+- **Startup — Start minimized to tray (on by default):** IC-SYNC launches
+  minimized to the tray/taskbar, with syncing already running — see
+  [Start minimized to tray](#start-minimized-to-tray).
+- **Startup — Launch at login (off by default):** start IC-SYNC automatically
+  when you sign in to your desktop — see [Launch at login](#launch-at-login).
 - Pick a folder you own and can write to. Avoid the repository checkout and
   system directories.
 - You may set **remote allow/deny paths** to limit which iCloud Drive folders
@@ -117,8 +130,6 @@ local directory. This folder is where iCloud Drive files are mirrored as
   in [Instant sync and poll intervals](#instant-sync-and-poll-intervals).
 - **Theme:** choose System (follows your desktop), Light or Dark — see
   [Theme preference](#theme-preference).
-- **Start minimized to tray:** on by default — see
-  [Start minimized to tray](#start-minimized-to-tray).
 - **Auto-sync** is on by default; you can pause/resume it from the Dashboard.
 - **Credential mode:** secure (default) or the **UNSAFE** plain opt-in — see
   [Credential mode](#credential-mode-secure-vs-plain).
@@ -131,14 +142,35 @@ Your choice is saved in the configuration and restored on the next launch.
 
 ### Start minimized to tray
 
-In **Settings → Start minimized to tray** (on by default), IC-SYNC launches with
-only its tray icon and no main window, and the preference is saved in the
-configuration. Syncing is already running in that state; choose **Open IC-SYNC**
-in the tray menu to restore and focus the window.
+**Start minimized to tray** (Settings, **on by default**) makes IC-SYNC launch
+minimized to the system tray/taskbar instead of opening the main window. The
+preference is saved in the configuration, and syncing starts immediately in the
+background. Choose **Open IC-SYNC** in the tray menu at any time to restore and
+focus the window.
 
-This is the same as **closing** the window: the app stays in the tray and keeps
-syncing. It is not the same as **Quit**, which exits the app — see
-[Tray menu](#7-tray-menu).
+This matches what happens when you **close** the window: the app is minimized to
+the tray/taskbar and keeps syncing. It is not the same as **Quit**, which exits
+the app — see [Tray menu](#7-tray-menu).
+
+### Launch at login
+
+**Launch at login** (Settings → Startup, **off by default**) starts IC-SYNC
+automatically when you sign in to your desktop session:
+
+- **Linux:** IC-SYNC installs an XDG autostart `.desktop` entry in
+  `~/.config/autostart/`.
+- **Windows:** IC-SYNC adds a per-user entry at
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+An autostarted IC-SYNC launches **minimized to the tray/taskbar by default** and
+respects the **Start minimized to tray** setting — see
+[Start minimized to tray](#start-minimized-to-tray). Syncing begins in the
+background; choose **Open IC-SYNC** in the tray menu to restore and focus the
+window.
+
+Turning **Launch at login** off removes the autostart entry. If IC-SYNC cannot
+create or remove the entry (for example, because of filesystem or registry
+permissions), the error is reported in the UI so you can fix it and retry.
 
 ### Instant sync and poll intervals
 
@@ -221,7 +253,7 @@ without an explicit local tombstone**.
 The tray applet is always available while IC-SYNC is running:
 
 - **Open IC-SYNC** — restore and focus the main window, including when the app
-  started minimized to the tray.
+  started minimized to the tray (for example via **Launch at login**).
 - **Sync now** — request an immediate full sync (same as Force sync).
 - **Status text** — a read-only line showing the current state and a short
   message, plus last/next sync details where space allows.
@@ -230,10 +262,12 @@ The tray applet is always available while IC-SYNC is running:
 
 **Close, Start minimized and Quit are different things:**
 
-- **Close** (the window's X button) only hides the main window to the tray;
-  IC-SYNC keeps syncing in the background.
+- **Close** (the window's X button, Super+Q, or your window manager's close
+  action) **minimizes IC-SYNC to the tray/taskbar**; the process keeps running
+  and syncing continues in the background.
 - **Start minimized to tray** (Settings, on by default) launches IC-SYNC in that
-  same hidden state with syncing already running.
+  same minimized state with syncing already running; **Launch at login** (off by
+  default) starts it that way when you sign in to your desktop.
 - **Quit** (tray menu) exits completely and stops syncing. To get the window
   back without quitting, choose **Open IC-SYNC** from the tray.
 
@@ -262,7 +296,9 @@ automatically; there is no need to restart the app.
 
 **Sign-in fails with a 2FA error**
 - Generate a fresh code; codes expire quickly.
-- If you selected a trusted device but have none available, enable **Force SMS**.
+- Make sure the code matches the **Verification method** you selected. If Apple
+  rejects it with `-21669`, switch the method (iPhone / trusted device ↔ SMS to
+  trusted number) and enter the code delivered for the newly selected method.
 - Repeated failures can trigger Apple's rate limiting. Wait a while before
   retrying, and do not repeatedly restart the app.
 

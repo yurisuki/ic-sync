@@ -5,6 +5,8 @@ use iced::{Element, Fill};
 
 use ic_core::config::{CredentialMode, ThemePreference};
 
+use crate::worker::VerificationMethod;
+
 use super::theme;
 use super::{App, Message, display_countdown, display_time, path_text};
 
@@ -39,6 +41,12 @@ fn action<'a>(label: &'static str, message: Message, primary: bool) -> Element<'
         button.style(theme::secondary_button)
     }
     .into()
+}
+
+/// Non-interactive, visually muted counterpart of `action`. With no
+/// `on_press`, Iced renders it as disabled and ignores clicks on it.
+fn disabled_action(label: &'static str) -> Element<'static, Message> {
+    button(label).style(theme::disabled_button).into()
 }
 
 fn setup(app: &App) -> Element<'_, Message> {
@@ -77,18 +85,23 @@ fn setup(app: &App) -> Element<'_, Message> {
             )
             .size(12)
             .color(theme::text_muted(dark)),
-            checkbox_row(
-                app.force_sms,
-                "Force SMS verification",
-                Message::ForceSmsChanged,
-            ),
+            text("Verification method").size(13).color(theme::text_muted(dark)),
+            verification_method_selector(app.verification_method),
             checkbox_row(
                 app.accept_terms,
                 "I accept the iCloud terms of service",
                 Message::AcceptTermsChanged,
             ),
             if app.auth_busy {
-                text("Signing in…").color(theme::blue(dark))
+                let waiting = match app.verification_method {
+                    crate::worker::VerificationMethod::TrustedDevice => {
+                        "Waiting for verification on your iPhone…"
+                    }
+                    crate::worker::VerificationMethod::Sms => "Waiting for SMS code…",
+                };
+                text(waiting).color(theme::blue(dark))
+            } else if app.two_factor.is_some() {
+                text("Waiting for verification…").color(theme::blue(dark))
             } else {
                 text("")
             },
@@ -103,19 +116,47 @@ fn setup(app: &App) -> Element<'_, Message> {
     ));
 
     if let Some(prompt) = &app.two_factor {
+        let instruction = if prompt.route.is_trusted_device() {
+            "Enter the code shown on your iPhone"
+        } else {
+            "Enter the code sent by SMS"
+        };
+        let hint = prompt.hint.as_deref().unwrap_or("");
         content = content.push(section(
             "Two-factor verification",
             column![
-                text(format!("Method: {}", debug_text(&prompt.method))).size(14),
-                text(format!("Hint: {}", debug_text(&prompt.hint)))
-                    .size(14)
+                text(instruction).size(15),
+                text(format!("Method reported by Apple: {}", prompt.method))
+                    .size(12)
                     .color(theme::text_muted(dark)),
+                text(if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!("Sent to: {hint}")
+                })
+                .size(13)
+                .color(theme::text_muted(dark)),
+                text("Wrong method? Choose another one below, then resend the code.")
+                    .size(12)
+                    .color(theme::text_muted(dark)),
+                verification_method_selector(app.verification_method),
+                row![
+                    action(
+                        "Verify",
+                        Message::SubmitCode {
+                            accept_terms: app.accept_terms,
+                        },
+                        true,
+                    ),
+                    action("Resend code / use this method", Message::ResendCode, false),
+                ]
+                .spacing(theme::SPACE_SMALL)
+                .wrap(),
                 field(
                     "6-digit code",
                     text_input("123456", &app.code)
                         .on_input(Message::CodeChanged)
                         .on_submit(Message::SubmitCode {
-                            force_sms: app.force_sms,
                             accept_terms: app.accept_terms,
                         })
                         .padding(12)
@@ -124,21 +165,32 @@ fn setup(app: &App) -> Element<'_, Message> {
                         .into(),
                     dark,
                 ),
-                row![action(
-                    "Verify",
-                    Message::SubmitCode {
-                        force_sms: app.force_sms,
-                        accept_terms: app.accept_terms,
-                    },
-                    true
-                )]
-                .spacing(theme::SPACE),
             ]
             .spacing(theme::SPACE),
         ));
     }
 
     scrollable(content).height(Fill).into()
+}
+
+/// Verification method: trusted device first (recommended), SMS second.
+/// Security-key accounts are handled automatically by core, not offered here.
+fn verification_method_selector(selected: VerificationMethod) -> Element<'static, Message> {
+    row![
+        choice_button(
+            "iPhone / trusted device (recommended)",
+            selected == VerificationMethod::TrustedDevice,
+            Message::VerificationMethodChanged(VerificationMethod::TrustedDevice),
+        ),
+        choice_button(
+            "SMS to trusted number (second option)",
+            selected == VerificationMethod::Sms,
+            Message::VerificationMethodChanged(VerificationMethod::Sms),
+        ),
+    ]
+    .spacing(theme::SPACE_SMALL)
+    .wrap()
+    .into()
 }
 
 fn checkbox_row<'a>(
@@ -191,8 +243,14 @@ fn dashboard(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10);
 
+    let sync_control = if app.can_sync() {
+        action("Force sync", Message::ForceSync, true)
+    } else {
+        disabled_action("Force sync")
+    };
+
     let controls = row![
-        action("Force sync", Message::ForceSync, true),
+        sync_control,
         action(
             if app.config.auto_sync {
                 "Pause auto-sync"
@@ -276,7 +334,27 @@ fn settings(app: &App) -> Element<'_, Message> {
     ]
     .spacing(theme::SPACE_SMALL);
 
-    let mut content = column![section("Sync folder", folder)];
+    // Startup is first and prominent: these are the two people most often
+    // look for when IC-SYNC is set to run in the background.
+    let startup = column![
+        toggler(draft.start_minimized)
+            .label("Start minimized to tray")
+            .on_toggle(Message::StartMinimizedChanged)
+            .text_size(14),
+        text("On by default. IC-SYNC starts in the tray/taskbar; use Open IC-SYNC to show the window.")
+            .size(12)
+            .color(theme::text_muted(dark)),
+        toggler(draft.autostart)
+            .label("Launch at login (autostart)")
+            .on_toggle(Message::AutostartChanged)
+            .text_size(14),
+        text("Starts IC-SYNC automatically when you log in; uses the startup preference above.")
+            .size(12)
+            .color(theme::text_muted(dark)),
+    ]
+    .spacing(theme::SPACE_SMALL);
+
+    let mut content = column![section("Startup", startup), section("Sync folder", folder)];
 
     if let Some(warning) = &app.warning {
         content = content.push(
@@ -285,7 +363,11 @@ fn settings(app: &App) -> Element<'_, Message> {
                     text("Folder move needs a clean sync").size(16),
                     text(warning.to_string()).size(14),
                     row![
-                        action("Sync now, then move", Message::SyncThenMove, true),
+                        if app.can_sync() {
+                            action("Sync now, then move", Message::SyncThenMove, true)
+                        } else {
+                            disabled_action("Sync now, then move")
+                        },
                         action("Dismiss", Message::DismissWarning, false),
                     ]
                     .spacing(theme::SPACE_SMALL),
@@ -384,19 +466,6 @@ fn settings(app: &App) -> Element<'_, Message> {
     .spacing(theme::SPACE);
 
     content = content.push(section("Schedule", timing));
-
-    // Startup: hide the window at launch and keep syncing from the tray.
-    let startup = column![
-        toggler(draft.start_minimized)
-            .label("Start minimized to tray")
-            .on_toggle(Message::StartMinimizedChanged)
-            .text_size(14),
-        text("IC-SYNC stays running in the tray. Closing the window also hides it there; use the tray icon to reopen.")
-            .size(12)
-            .color(theme::text_muted(dark)),
-    ]
-    .spacing(theme::SPACE_SMALL);
-    content = content.push(section("Startup", startup));
 
     // Credential storage: the unsafe option is deliberately loud.
     let plain = draft.credential_mode == CredentialMode::Plain;
