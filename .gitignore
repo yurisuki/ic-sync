@@ -1,0 +1,86 @@
+# ---------------------------------------------------------------------------
+# Rust build output
+# ---------------------------------------------------------------------------
+/target/
+**/target/
+*.rlib
+*.rmeta
+*.d
+*.exe
+
+# ---------------------------------------------------------------------------
+# Credentials, sessions, tokens and local configuration
+# NEVER commit an Apple ID, password, cookie jar, session JSON or trust token.
+# These patterns are a safety net only: always check `git status` before a
+# commit, because a renamed or hand-created file may not be matched here.
+# ---------------------------------------------------------------------------
+*.session
+*.sessions
+*.cookiejar
+*.cookies
+*cookies.json
+*cookie*.json
+*session*.json
+*token*.json
+*trust-token*
+config.yaml
+config.yml
+config.toml.local
+icloud.env
+*.env
+!.env.example
+credentials.*
+secrets.*
+*.p12
+*.pem
+*.key
+*.pfx
+
+# Local runtime state / caches / databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+status.json
+sync-state.json
+sync_state.json
+pending_ops.json
+*.lock.local
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+*.log
+logs/
+log/
+ic-sync.log.*
+*.log.*
+
+# ---------------------------------------------------------------------------
+# OS / editor junk
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# ---------------------------------------------------------------------------
+# Test / coverage output
+# ---------------------------------------------------------------------------
+/coverage/
+*.profraw
+*.profdata

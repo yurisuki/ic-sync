@@ -1,0 +1,37 @@
+[package]
+name = "ic-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Headless sync engine and persistence for IC-SYNC"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+cookie.workspace = true
+cookie_store.workspace = true
+base64.workspace = true
+url.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+rusqlite.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+chrono.workspace = true
+notify.workspace = true
+keyring.workspace = true

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/ic-core", "crates/ic-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["IC-SYNC contributors"]
+repository = "https://github.com/yurisuki/ic-sync"
+homepage = "https://github.com/yurisuki/ic-sync"
+
+[workspace.dependencies]
+ic-core = { path = "crates/ic-core" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.13"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "cookies", "query", "stream", "multipart", "rustls"] }
+cookie = "0.18"
+cookie_store = "0.22"
+base64 = "0.22"
+url = "2"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = { version = "0.9", features = ["os_rng"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+notify = "8"
+keyring = "4"
+iced = "0.14"
+tray-icon = "0.26"
+image = "0.25"
