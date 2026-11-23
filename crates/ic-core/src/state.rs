@@ -121,7 +121,16 @@ impl Database {
             CREATE TABLE IF NOT EXISTS sync_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            );",
+            );
+            -- Older builds queued the same create/modify op hundreds of times
+            -- for one path (a huge local tree could produce thousands of rows).
+            -- Collapse the legacy duplicates before adding the uniqueness guard.
+            DELETE FROM pending_ops WHERE id NOT IN (
+                SELECT MIN(id) FROM pending_ops
+                GROUP BY op, path, IFNULL(target_path, '')
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_ops_unique
+                ON pending_ops(op, path, IFNULL(target_path, ''));",
         )?;
         let has_shareid: bool = conn
             .prepare("PRAGMA table_info(entries)")?
@@ -222,6 +231,17 @@ impl Database {
         Ok(())
     }
 
+    /// Whether any queued operation still refers to this path. Used by the
+    /// crawler to never purge an entry whose local change is awaiting upload.
+    pub fn has_pending_op(&self, path: &str) -> Result<bool> {
+        let conn = self.connection.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_ops WHERE path=?1 OR target_path=?1)",
+            params![path],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     /// True when a queued operation records a real local edit (create/modify/
     /// rename/delete). Hydration writes never queue such an operation, so this
     /// distinguishes user changes from self-generated write events.
@@ -278,8 +298,12 @@ impl Database {
             }
         }
         let now = chrono::Utc::now().timestamp();
+        // One operation per (op, path, target). Repeated watcher events for the
+        // same file must never multiply the backlog; the unique index is the
+        // final guard, `OR IGNORE` keeps repeated queuing a no-op.
         conn.execute(
-            "INSERT INTO pending_ops (op, path, target_path, queued_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO pending_ops (op, path, target_path, queued_at) \
+             VALUES (?1, ?2, ?3, ?4)",
             params![op, path, target_path, now],
         )?;
         Ok(())
@@ -432,7 +456,7 @@ impl Database {
                 params![entry.path, new_path, new_parent],
             )?;
             conn.execute(
-                "UPDATE pending_ops SET path=?2 WHERE path=?1",
+                "UPDATE OR IGNORE pending_ops SET path=?2 WHERE path=?1",
                 params![entry.path, new_path],
             )?;
         }
@@ -610,7 +634,7 @@ impl Database {
                 )?;
             }
             conn.execute(
-                "UPDATE pending_ops SET path=CASE \
+                "UPDATE OR IGNORE pending_ops SET path=CASE \
                      WHEN path=?1 THEN ?2 \
                      WHEN path LIKE ?3 THEN ?4 || substr(path, ?5) \
                      ELSE path END, \
@@ -676,7 +700,7 @@ impl Database {
                 ],
             )?;
             conn.execute(
-                "UPDATE pending_ops SET path=CASE \
+                "UPDATE OR IGNORE pending_ops SET path=CASE \
                      WHEN path=?1 THEN ?2 \
                      WHEN path LIKE ?3 THEN ?4 || substr(path, ?5) \
                      ELSE path END, \
@@ -790,6 +814,71 @@ mod tests {
         db.queue_op("create", "/note.txt", None).unwrap();
         db.queue_op("delete", "/note.txt", None).unwrap();
         assert!(db.list_pending_ops().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_op_lookup_covers_paths_and_targets() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        assert!(!db.has_pending_op("/cic-research").unwrap());
+        db.queue_op("create", "/cic-research", None).unwrap();
+        assert!(db.has_pending_op("/cic-research").unwrap());
+        db.queue_op("rename", "/new", Some("/cic-research"))
+            .unwrap();
+        assert!(db.has_pending_op("/cic-research").unwrap());
+        assert!(db.has_pending_op("/new").unwrap());
+    }
+
+    #[test]
+    fn identical_pending_ops_are_deduplicated() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
+        // A flood of watcher events for one new folder must not create a
+        // duplicate `create` op per event (the live bug produced 58+ rows).
+        for _ in 0..40 {
+            db.queue_op("create", "/cic-research", None).unwrap();
+        }
+        db.queue_op("create", "/cic-research", Some("/old"))
+            .unwrap();
+        db.queue_op("create", "/cic-research", None).unwrap();
+        db.queue_op("modify", "/cic-research", None).unwrap();
+
+        let ops = db.list_pending_ops().unwrap();
+        assert_eq!(ops.len(), 3, "ops: {ops:?}");
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.op == "create"
+                    && op.path == "/cic-research"
+                    && op.target_path.is_none())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn opening_legacy_database_collapses_duplicate_ops() {
+        let dir = TempDir::new();
+        let path = dir.path.join("state.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.queue_op("create", "/cic-research", None).unwrap();
+            // Simulate rows written by the old, unguarded queue_op.
+            let conn = db.connection.lock().unwrap();
+            conn.execute("DROP INDEX idx_pending_ops_unique", [])
+                .unwrap();
+            for _ in 0..12 {
+                conn.execute(
+                    "INSERT INTO pending_ops (op, path, target_path, queued_at) \
+                     VALUES ('create', '/cic-research', NULL, 0)",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.list_pending_ops().unwrap().len(), 1);
+        db.queue_op("create", "/cic-research", None).unwrap();
+        assert_eq!(db.list_pending_ops().unwrap().len(), 1);
     }
 
     #[test]

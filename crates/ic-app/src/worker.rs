@@ -424,6 +424,9 @@ impl Worker {
             return;
         }
 
+        if let Some(old) = self.engine.take() {
+            old.shutdown();
+        }
         self.api = Some(api);
         self.engine = Some(engine);
         self.activity(LogLevel::Success, "Connected. Automatic sync is running.");
@@ -513,6 +516,9 @@ impl Worker {
                 if let Err(err) = engine.start().await {
                     self.error("Starting sync engine", &err);
                     return;
+                }
+                if let Some(old) = self.engine.take() {
+                    old.shutdown();
                 }
                 self.engine = Some(engine);
             }
