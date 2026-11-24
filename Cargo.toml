@@ -9,7 +9,6 @@ rust-version = "1.90"
 license = "MIT"
 authors = ["IC-SYNC contributors"]
 repository = "https://github.com/yurisuki/ic-sync"
-homepage = "https://github.com/yurisuki/ic-sync"
 
 [workspace.dependencies]
 ic-core = { path = "crates/ic-core" }
@@ -40,5 +39,4 @@ chrono = { version = "0.4", features = ["serde"] }
 notify = "8"
 keyring = "4"
 iced = "0.14"
-tray-icon = "0.26"
 image = "0.25"
