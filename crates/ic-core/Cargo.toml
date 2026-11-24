@@ -9,14 +9,12 @@ repository.workspace = true
 description = "Headless sync engine and persistence for IC-SYNC"
 
 [dependencies]
-anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 reqwest.workspace = true
 cookie.workspace = true
 cookie_store.workspace = true

@@ -58,7 +58,7 @@ fn state_variant(base: &RgbaIcon, state: SyncState) -> RgbaIcon {
         return base.clone();
     };
     let mut rgba = base.rgba.clone();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         if pixel[3] == 0 {
             continue;
         }
