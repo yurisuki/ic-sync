@@ -31,7 +31,7 @@ Releases are defined in
 [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 - **Releases are created only when a tag matching `v*` is pushed** (for example
-  `v0.1.0`). Pushes to branches and pull requests never publish a release.
+  `v0.1.1`). Pushes to branches and pull requests never publish a release.
 - Recommended versioning: `vMAJOR.MINOR.PATCH` (optionally with a suffix such as
   `v0.2.0-rc.1`). The tag should match the workspace version in `Cargo.toml`.
 - Workflow permissions are limited to `contents: write` so the job can attach
@@ -42,8 +42,8 @@ Releases are defined in
 ```sh
 # 1. Make sure CI is green on the commit you intend to release.
 # 2. Confirm the workspace version in Cargo.toml is correct.
-git tag -a v0.1.0 -m "IC-SYNC v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "IC-SYNC v0.1.1"
+git push origin v0.1.1
 ```
 
 The workflow then:
@@ -54,8 +54,9 @@ The workflow then:
    docs and assets.
 3. Uploads each archive as a GitHub Actions artifact
    (`actions/upload-artifact`).
-4. Downloads all artifacts, computes a `SHA256SUMS` file, and attaches every
-   archive plus `SHA256SUMS` to the GitHub release
+4. Downloads all artifacts, adds the source tarball for the tag, computes a
+   `SHA256SUMS` file covering every archive and the source tarball, and attaches
+   them plus `SHA256SUMS` to the GitHub release
    (`softprops/action-gh-release`). Release notes are generated from merged
    commits.
 

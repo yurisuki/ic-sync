@@ -1,9 +1,9 @@
 //! Icon loading and conversion shared by the Iced window and the system tray.
 //!
-//! The preferred icon is `assets/ic-sync.png` (or one of the sized variants
-//! produced by the assets job).  Everything here degrades gracefully to a
-//! procedurally generated icon, so this crate compiles and runs even before the
-//! asset generation job has finished.
+//! The branded cloud PNG is embedded into the executable at compile time, so
+//! installed builds always have it regardless of working directory, XDG data
+//! paths or whether a source tree is present. A procedurally generated icon
+//! remains as a last-resort fallback if the embedded bytes cannot be decoded.
 //!
 //! Tray and window icons are the plain cloud asset tinted by `SyncState`:
 //! green when idle, orange while working, red on error, gray when offline.
@@ -73,47 +73,28 @@ fn state_variant(base: &RgbaIcon, state: SyncState) -> RgbaIcon {
     }
 }
 
-/// Candidate locations, in priority order, for the branded icon.
-fn candidate_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
+/// The branded cloud PNG, compiled into the binary. Relative to this file:
+/// crates/ic-app/src -> crates/ic-app -> crates -> repository root.
+const EMBEDDED_ICON_PNG: &[u8] = include_bytes!("../../../assets/ic-sync.png");
 
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let root = std::path::Path::new(&manifest);
-        // crates/ic-app -> repository root
-        if let Some(repo) = root.parent().and_then(|p| p.parent()) {
-            paths.push(repo.join("assets/ic-sync.png"));
-            paths.push(repo.join("assets/ic-sync-256.png"));
-            paths.push(repo.join("assets/ic-sync-icon.png"));
-        }
-    }
-
-    // Also try relative to the process working directory (installed layouts).
-    paths.push(std::path::PathBuf::from("assets/ic-sync.png"));
-    paths.push(std::path::PathBuf::from("ic-sync.png"));
-    paths
-}
-
-/// Loads the branded icon if available, otherwise generates a clean fallback.
+/// Loads the embedded branded icon, falling back to a generated one only if
+/// the embedded bytes cannot be decoded.
 pub fn load() -> RgbaIcon {
-    for path in candidate_paths() {
-        if !path.is_file() {
-            continue;
+    match decode_png(EMBEDDED_ICON_PNG) {
+        Ok(icon) => {
+            tracing::debug!("Using embedded app icon");
+            icon
         }
-        match load_file(&path) {
-            Ok(icon) => {
-                tracing::debug!("Using app icon from {}", path.display());
-                return icon;
-            }
-            Err(err) => tracing::warn!("Could not read icon {}: {err}", path.display()),
+        Err(err) => {
+            tracing::warn!("Could not decode embedded app icon: {err}");
+            tracing::debug!("Using generated fallback app icon");
+            generated()
         }
     }
-
-    tracing::debug!("Using generated fallback app icon");
-    generated()
 }
 
-fn load_file(path: &std::path::Path) -> Result<RgbaIcon, image::ImageError> {
-    let img = image::open(path)?;
+fn decode_png(bytes: &[u8]) -> Result<RgbaIcon, image::ImageError> {
+    let img = image::load_from_memory(bytes)?;
     let resized = img.resize_exact(ICON_SIZE, ICON_SIZE, image::imageops::FilterType::Lanczos3);
     let rgba = resized.to_rgba8().into_raw();
     Ok(RgbaIcon {
@@ -198,5 +179,28 @@ fn pixel(x: f32, y: f32, size: f32) -> [u8; 4] {
         [255, 255, 255, 255]
     } else {
         bg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_brand_icon_is_decoded() {
+        let icon = load();
+        assert_eq!(icon.width, ICON_SIZE);
+        assert_eq!(icon.height, ICON_SIZE);
+        assert_eq!(icon.rgba.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
+
+        // The real asset has opaque, non-black pixels; the generated fallback
+        // would not prove that the embedded PNG was actually used.
+        assert!(
+            icon.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] == 255 && px[..3] != [0, 0, 0])
+        );
     }
 }

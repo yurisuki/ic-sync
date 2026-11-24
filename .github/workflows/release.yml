@@ -131,6 +131,18 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          # Include the source tarball so the AUR packages can verify every
+          # download against this single GitHub-hosted checksum file instead
+          # of hard-coding hashes in each PKGBUILD.
+          version="${GITHUB_REF_NAME#v}"
+          source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL "$source_url" -o "ic-sync-${version}.tar.gz"; then
+              break
+            fi
+            sleep 10
+          done
+          test -s "ic-sync-${version}.tar.gz"
           sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 

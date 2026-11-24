@@ -916,7 +916,7 @@ fn about(app: &App) -> Element<'_, Message> {
         section(
             "IC-SYNC",
             column![
-                text("Version 0.1.0").size(15),
+                text(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(15),
                 text("A native, standalone iCloud Drive folder sync application.").size(14),
                 text("Built with Rust, Iced and Tokio. No Python, no webview.")
                     .size(13)
