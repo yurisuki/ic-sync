@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=IC-SYNC
+GenericName=iCloud Drive Sync
+Comment=Native iCloud Drive sync client
+Exec=ic-sync
+Icon=ic-sync
+Terminal=false
+Categories=Network;FileTransfer;
+StartupNotify=true
