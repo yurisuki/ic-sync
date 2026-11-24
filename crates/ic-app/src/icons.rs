@@ -42,9 +42,7 @@ fn state_color(state: SyncState) -> Option<[u8; 3]> {
         // Idle: green.
         SyncState::Synced => [46, 176, 101],
         // Working: orange.
-        SyncState::Syncing
-        | SyncState::Relocating
-        | SyncState::LoginRequired => [240, 170, 40],
+        SyncState::Syncing | SyncState::Relocating | SyncState::LoginRequired => [240, 170, 40],
         // Error: red.
         SyncState::Error => [220, 70, 70],
         // Not syncing at all: gray.

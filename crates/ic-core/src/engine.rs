@@ -1654,7 +1654,9 @@ impl EngineInner {
     /// pushes them like any other local change.
     fn scan_untracked_local_files(&self) {
         fn walk(dir: &Path, icloud: &str, out: &mut Vec<String>) {
-            let Ok(entries) = fs::read_dir(dir) else { return };
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let relative = if icloud.is_empty() {
