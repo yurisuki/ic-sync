@@ -8,6 +8,7 @@
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
+use ic_core::status::{ServiceStatus, SyncState};
 use iced::futures::Stream;
 use iced::futures::sink::SinkExt;
 use iced::{Subscription, stream};
@@ -57,11 +58,11 @@ fn action_stream() -> impl Stream<Item = TrayAction> {
 /// `MenuItem` is not `Send`, so the GUI sends plain values and the tray thread
 /// applies them to the menu items it owns.
 enum TrayUpdate {
-    Status(String),
+    Status(Box<ServiceStatus>),
     SyncEnabled(bool),
 }
 
-/// Handle used by the GUI to push short status text into the tray menu and to
+/// Handle used by the GUI to push live status into the tray menu/icon and to
 /// enable/disable the "Sync now" item according to the session state.
 #[derive(Clone)]
 pub struct TrayHandle {
@@ -70,8 +71,19 @@ pub struct TrayHandle {
 
 impl TrayHandle {
     /// Non-blocking; the GUI must never wait on the tray thread.
-    pub fn set_status(&self, text: impl Into<String>) {
-        let _ = self.updates.try_send(TrayUpdate::Status(text.into()));
+    pub fn set_status(&self, status: &ServiceStatus) {
+        let _ = self
+            .updates
+            .try_send(TrayUpdate::Status(Box::new(status.clone())));
+    }
+
+    /// Reflect a pending 2FA challenge in the tray even before the engine has
+    /// published a status document for it.
+    pub fn set_verification_required(&self) {
+        let mut status =
+            ServiceStatus::new(SyncState::LoginRequired, "two-factor verification required");
+        status.pending = 0;
+        self.set_status(&status);
     }
 
     /// Grey out (or restore) "Sync now" when there is no valid session.
@@ -102,7 +114,8 @@ fn run_tray(
     updates: mpsc::Receiver<TrayUpdate>,
     initial_sync_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let icon = crate::icons::load()
+    let base_icon = crate::icons::load();
+    let icon = base_icon
         .tray_icon()
         .ok_or("could not build tray icon from RGBA data")?;
 
@@ -110,6 +123,8 @@ fn run_tray(
     let open = MenuItem::with_id("open", "Open IC-SYNC", true, None);
     let sync = MenuItem::with_id("sync", "Sync now", initial_sync_enabled, None);
     let status = MenuItem::with_id("status", "Status: Starting…", false, None);
+    let process = MenuItem::with_id("process", "Process: Idle", false, None);
+    let current = MenuItem::with_id("current", "Current: —", false, None);
     let separator = PredefinedMenuItem::separator();
     let separator2 = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id("quit", "Quit IC-SYNC", true, None);
@@ -118,6 +133,8 @@ fn run_tray(
     menu.append(&sync)?;
     menu.append(&separator)?;
     menu.append(&status)?;
+    menu.append(&process)?;
+    menu.append(&current)?;
     menu.append(&separator2)?;
     menu.append(&quit)?;
 
@@ -135,6 +152,7 @@ fn run_tray(
     tracing::info!("System tray icon created");
 
     let mut sync_enabled = initial_sync_enabled;
+    let mut icon_state: Option<SyncState> = None;
 
     loop {
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
@@ -175,7 +193,46 @@ fn run_tray(
 
         while let Ok(update) = updates.try_recv() {
             match update {
-                TrayUpdate::Status(text) => status.set_text(format!("Status: {text}")),
+                TrayUpdate::Status(service_status) => {
+                    let label = service_status.state.label();
+                    let step = if service_status.detail.summary().is_empty() {
+                        service_status.message.clone()
+                    } else {
+                        service_status.detail.summary()
+                    };
+                    status.set_text(format!(
+                        "Status: {label} · {} pending",
+                        service_status.pending
+                    ));
+                    process.set_text(format!("Process: {step}"));
+                    let item = service_status.detail.current_item.as_deref().unwrap_or("—");
+                    current.set_text(format!("Current: {}", shorten(item, 64)));
+
+                    // The icon itself carries the state: colour + badge. Only
+                    // rebuild it when the state actually changed; a failed
+                    // rebuild leaves `icon_state` unset so the next status
+                    // update retries.
+                    if icon_state != Some(service_status.state) {
+                        match base_icon.state_tray_icon(service_status.state) {
+                            Some(next) => match _tray.set_icon(Some(next)) {
+                                Ok(()) => icon_state = Some(service_status.state),
+                                Err(error) => {
+                                    tracing::warn!("Could not update tray icon: {error}")
+                                }
+                            },
+                            None => icon_state = Some(service_status.state),
+                        }
+                    }
+
+                    let tooltip = if service_status.detail.current_item.is_some() {
+                        format!("IC-SYNC — {label}: {} ({})", step, shorten(item, 48))
+                    } else {
+                        format!("IC-SYNC — {label}: {step}")
+                    };
+                    if let Err(error) = _tray.set_tooltip(Some(tooltip)) {
+                        tracing::warn!("Could not update tray tooltip: {error}");
+                    }
+                }
                 TrayUpdate::SyncEnabled(enabled) => {
                     sync_enabled = enabled;
                     sync.set_enabled(enabled);
@@ -185,4 +242,13 @@ fn run_tray(
 
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Keep tray text readable when a path is very long.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let start: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{start}…")
 }

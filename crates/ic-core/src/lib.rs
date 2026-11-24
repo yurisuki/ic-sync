@@ -10,11 +10,7 @@ pub mod autostart;
 pub mod bridge;
 // The prover is a byte-for-byte port of Apple's/Python's transcript handling;
 // the low-level hex and bit-length idioms are intentional.
-#[allow(
-    clippy::chunks_exact_to_as_chunks,
-    clippy::manual_div_ceil,
-    clippy::manual_is_multiple_of
-)]
+#[allow(clippy::manual_div_ceil, clippy::manual_is_multiple_of)]
 pub mod bridge_prover;
 pub mod config;
 pub mod engine;

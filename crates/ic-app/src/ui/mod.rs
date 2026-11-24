@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use iced::theme::Mode as SystemThemeMode;
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, row, text, text_editor};
 use iced::{Element, Task, Theme};
 
 use ic_core::config::{Config, CredentialMode, ThemePreference};
-use ic_core::status::{self, ServiceStatus, SyncState};
+use ic_core::status::{self, ServiceStatus, SyncPhase, SyncState};
 
 use crate::tray::{self, TrayHandle};
 use crate::worker::{self, GuiMessage, LogLevel, WorkerEvent};
@@ -37,6 +37,37 @@ impl Page {
             Page::Settings => "Settings",
             Page::Activity => "Activity",
             Page::About => "About",
+        }
+    }
+}
+
+/// Category filter for the Activity page. `Success` is grouped with `Info`
+/// because both describe normal operation; only `Warning` and `Error` are
+/// problems the user may want to isolate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivityFilter {
+    All,
+    Info,
+    Warning,
+    Error,
+}
+
+impl ActivityFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Info => "Info",
+            Self::Warning => "Warn",
+            Self::Error => "Error",
+        }
+    }
+
+    pub fn matches(self, level: LogLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Info => matches!(level, LogLevel::Info | LogLevel::Success),
+            Self::Warning => level == LogLevel::Warning,
+            Self::Error => level == LogLevel::Error,
         }
     }
 }
@@ -119,10 +150,14 @@ pub struct App {
 
     // Feedback
     pub activity: Vec<ActivityEntry>,
+    pub activity_filter: ActivityFilter,
     pub toast: Option<Toast>,
     pub warning: Option<String>,
     pub pending_relocation: Option<PathBuf>,
     pub confirm_forget: bool,
+    /// Set when the user asks to quit while an upload/download is in flight;
+    /// `Tick` completes the shutdown once the engine goes idle.
+    pub pending_quit: bool,
 
     /// OS-reported mode, used when `config.theme` is `system`.
     pub system_mode: SystemThemeMode,
@@ -133,10 +168,22 @@ pub struct App {
     pub tray: Option<TrayHandle>,
     /// Whether a completed Apple sign-in is available for this session.
     pub signed_in: bool,
+    /// A spinning frame counter advanced by `Tick`; the loading wheel uses it.
+    pub loading_frame: usize,
+    /// Read-only copy of the activity log for the Activity page's text form.
+    pub activity_editor: text_editor::Content,
     /// The single main window, if it is currently open. Daemon mode lets us
     /// destroy it on close without exiting the process.
     window_id: Option<iced::window::Id>,
+    /// The dedicated 2FA window, when a code challenge is in progress.
+    verification_window: Option<iced::window::Id>,
     last_state: Option<String>,
+    /// Highest `notice_seq` already shown, so a warning is notified once.
+    last_notice_seq: u64,
+    /// Last engine error already shown as a notification.
+    last_error_message: Option<String>,
+    /// Throttles the status poll that feeds live progress to the dashboard.
+    last_status_poll: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +231,16 @@ pub enum Message {
     SyncThenMove,
     DismissWarning,
 
+    /// Open/close the dedicated, always-on-top two-factor window.
+    OpenVerificationWindow,
+    CloseVerificationWindow,
+    VerificationWindowOpened(iced::window::Id),
+    /// Quit after the current sync operation finishes.
+    QuitApp,
+    FilterActivity(ActivityFilter),
+    /// Write the activity log to a file and toast the path.
+    ExportLogs,
+
     Worker(Box<WorkerEvent>),
     Tray(tray::TrayAction),
     CloseRequested(iced::window::Id),
@@ -219,18 +276,26 @@ pub fn new() -> (App, Task<Message>) {
         auth_busy: false,
         auth_error: None,
         activity: Vec::new(),
+        activity_filter: ActivityFilter::All,
         toast: None,
         warning: None,
         pending_relocation: None,
         confirm_forget: false,
+        pending_quit: false,
         system_mode: SystemThemeMode::Light,
         last_theme_probe: Instant::now(),
         secure_storage,
         secure_available,
         tray,
         signed_in,
+        loading_frame: 0,
+        activity_editor: text_editor::Content::new(),
         window_id: None,
+        verification_window: None,
         last_state: None,
+        last_notice_seq: status.as_ref().map_or(0, |status| status.notice_seq),
+        last_error_message: None,
+        last_status_poll: Instant::now(),
         status,
         config,
         draft,
@@ -281,8 +346,26 @@ fn secure_storage_label(mode: CredentialMode, available: bool) -> String {
     }
 }
 
-pub fn title(_app: &App) -> String {
-    "IC-SYNC".to_string()
+/// Title for a specific window. The verification popup is labelled separately
+/// so window switchers show what it is.
+pub fn title_for(app: &App, window: iced::window::Id) -> String {
+    match app.verification_window {
+        Some(id) if id == window => "IC-SYNC — Verification".to_string(),
+        _ => "IC-SYNC".to_string(),
+    }
+}
+
+/// Render the window identified by `window`. The main window shows the normal
+/// shell; the dedicated 2FA window shows only the code challenge.
+pub fn view_for<'a>(app: &'a App, window: iced::window::Id) -> Element<'a, Message> {
+    if app.verification_window == Some(window) {
+        return container(pages::two_factor(app))
+            .width(iced::Fill)
+            .height(iced::Fill)
+            .style(theme::page_style)
+            .into();
+    }
+    app.view()
 }
 
 /// Resolves the application theme from the persisted preference. `System`
@@ -360,6 +443,125 @@ impl App {
                 .is_some_and(|status| status.state == SyncState::LoginRequired)
     }
 
+    /// Whether the dedicated two-factor window is currently open.
+    pub fn verification_window_open(&self) -> bool {
+        self.verification_window.is_some()
+    }
+
+    /// Renders the full activity log as plain text, newest first. Shared by
+    /// the Activity page editor, the export button, and toast fallbacks.
+    pub fn activity_log_text(&self) -> String {
+        self.activity
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}  {:>8}  {}",
+                    entry.time,
+                    entry.level.label(),
+                    entry.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Exports the activity log to a timestamped file in the app's data dir.
+    fn export_activity_log(&mut self) {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let name = format!("ic-sync-activity-{stamp}.log");
+        let body = self.activity_log_text();
+        match ic_core::paths::data_dir() {
+            Ok(dir) => {
+                let path = dir.join(&name);
+                let result = std::fs::create_dir_all(&dir)
+                    .and_then(|()| std::fs::write(&path, format!("{body}\n")));
+                match result {
+                    Ok(()) => self.toast(
+                        LogLevel::Success,
+                        format!("Logs exported to {}", path.display()),
+                    ),
+                    Err(error) => {
+                        self.toast(LogLevel::Warning, format!("Could not export logs: {error}"))
+                    }
+                }
+            }
+            Err(error) => self.toast(LogLevel::Warning, format!("Could not export logs: {error}")),
+        }
+    }
+
+    /// True while an upload, download, crawl or folder move is in flight.
+    /// Quit waits for these so the user never loses a half-written transfer.
+    fn live_operation(&self) -> bool {
+        let Some(status) = &self.status else {
+            return false;
+        };
+        if matches!(status.state, SyncState::Syncing | SyncState::Relocating) {
+            return true;
+        }
+        matches!(
+            status.detail.phase,
+            SyncPhase::Connecting
+                | SyncPhase::RefreshingMetadata
+                | SyncPhase::Reconciling
+                | SyncPhase::Uploading
+                | SyncPhase::Downloading
+                | SyncPhase::Relocating
+        )
+    }
+
+    fn open_verification_window(&mut self) -> Task<Message> {
+        if self.verification_window.is_some() {
+            return Task::none();
+        }
+        let (id, opened) = iced::window::open(crate::two_factor_window_settings());
+        self.verification_window = Some(id);
+        Task::batch([
+            opened.map(move |_| Message::VerificationWindowOpened(id)),
+            iced::window::gain_focus(id),
+        ])
+    }
+
+    fn close_verification_window(&mut self) -> Task<Message> {
+        match self.verification_window.take() {
+            Some(id) => iced::window::close(id),
+            None => Task::none(),
+        }
+    }
+
+    /// Quit immediately when idle, otherwise finish the live operation first.
+    fn request_quit(&mut self) -> Task<Message> {
+        if self.pending_quit {
+            return Task::none();
+        }
+        if self.live_operation() {
+            self.pending_quit = true;
+            self.log(
+                LogLevel::Info,
+                "Quit requested; waiting for the current sync to finish",
+            );
+            self.toast(
+                LogLevel::Warning,
+                "Finishing the current sync before quitting…",
+            );
+            Task::none()
+        } else {
+            self.begin_shutdown()
+        }
+    }
+
+    fn begin_shutdown(&mut self) -> Task<Message> {
+        self.pending_quit = false;
+        self.log(LogLevel::Info, "Quitting");
+        self.command(GuiMessage::Shutdown);
+        self.window_id = None;
+        let mut tasks = Vec::new();
+        if let Some(id) = self.verification_window.take() {
+            tasks.push(iced::window::close(id));
+        }
+        tasks.push(iced::exit());
+        Task::batch(tasks)
+    }
+
     /// Push the current sync availability to the tray menu.
     fn refresh_tray_actions(&self) {
         if let Some(tray) = &self.tray {
@@ -373,6 +575,26 @@ impl App {
             secure_storage_label(self.config.credential_mode, self.secure_available);
     }
 
+    /// Rebuild `activity_editor` from the activity log and the active category
+    /// filter. Called on every new log entry and when the user switches filter.
+    fn refresh_activity_editor(&mut self) {
+        let text: String = self
+            .activity
+            .iter()
+            .filter(|entry| self.activity_filter.matches(entry.level))
+            .map(|entry| {
+                format!(
+                    "{}  {:>8}  {}",
+                    entry.time,
+                    entry.level.label(),
+                    entry.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.activity_editor = text_editor::Content::with_text(&text);
+    }
+
     fn log(&mut self, level: LogLevel, message: impl Into<String>) {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
         self.activity.insert(
@@ -384,6 +606,7 @@ impl App {
             },
         );
         self.activity.truncate(250);
+        self.refresh_activity_editor();
     }
 
     fn toast(&mut self, level: LogLevel, message: impl Into<String>) {
@@ -400,11 +623,7 @@ impl App {
 
     fn push_status_to_tray(&self, status: &ServiceStatus) {
         if let Some(tray) = &self.tray {
-            tray.set_status(format!(
-                "{} · {} pending",
-                state_label(&status.state),
-                status.pending
-            ));
+            tray.set_status(status);
         }
         self.refresh_tray_actions();
     }
@@ -690,6 +909,19 @@ impl App {
                 self.pending_relocation = None;
             }
 
+            Message::OpenVerificationWindow => return self.open_verification_window(),
+            Message::CloseVerificationWindow => return self.close_verification_window(),
+            Message::VerificationWindowOpened(id) => {
+                self.verification_window = Some(id);
+                return iced::window::gain_focus(id);
+            }
+            Message::QuitApp => return self.request_quit(),
+            Message::FilterActivity(filter) => {
+                self.activity_filter = filter;
+                self.refresh_activity_editor();
+            }
+            Message::ExportLogs => self.export_activity_log(),
+
             Message::Worker(event) => return self.handle_worker(*event),
             Message::Tray(action) => match action {
                 tray::TrayAction::Open => {
@@ -706,18 +938,17 @@ impl App {
                         self.command(GuiMessage::ForceSync);
                     }
                 }
-                tray::TrayAction::Quit => {
-                    self.log(LogLevel::Info, "Quit requested from tray");
-                    self.command(GuiMessage::Shutdown);
-                    self.window_id = None;
-                    return iced::exit();
-                }
+                tray::TrayAction::Quit => return self.request_quit(),
             },
             Message::CloseRequested(id) => {
-                // Destroy only the window. Iced is running in daemon mode, so
-                // the process, tray icon and sync engine stay alive. The tray
-                // menu opens a new window on demand.
-                self.window_id = None;
+                // Destroy only the window that was closed. Iced is running in
+                // daemon mode, so the process, tray icon and sync engine stay
+                // alive; the tray menu opens a new window on demand.
+                if self.verification_window == Some(id) {
+                    self.verification_window = None;
+                } else if self.window_id == Some(id) {
+                    self.window_id = None;
+                }
                 return iced::window::close(id);
             }
             Message::WindowOpened(id) => {
@@ -726,6 +957,7 @@ impl App {
             }
 
             Message::Tick => {
+                self.loading_frame = self.loading_frame.wrapping_add(1);
                 if self
                     .toast
                     .as_ref()
@@ -733,12 +965,28 @@ impl App {
                 {
                     self.toast = None;
                 }
+                // A quit requested during an upload/download waits for the
+                // engine to go idle; re-check on every tick.
+                if self.pending_quit && !self.live_operation() {
+                    return self.begin_shutdown();
+                }
+                let now = Instant::now();
+                let mut tasks = Vec::new();
+                // Live progress and engine warnings ride on the status
+                // document, so poll it once a second while the GUI is open.
+                if now.duration_since(self.last_status_poll) >= Duration::from_secs(1) {
+                    self.last_status_poll = now;
+                    self.command(GuiMessage::RefreshStatus);
+                }
                 // Polling fallback: some desktops never emit theme changes,
                 // so re-read the OS appearance every few seconds. This is
                 // cheap and also keeps the gsettings fallback up to date.
-                if Instant::now().duration_since(self.last_theme_probe) >= Duration::from_secs(3) {
-                    self.last_theme_probe = Instant::now();
-                    return probe_system_theme();
+                if now.duration_since(self.last_theme_probe) >= Duration::from_secs(3) {
+                    self.last_theme_probe = now;
+                    tasks.push(probe_system_theme());
+                }
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
                 }
             }
             Message::ClearToast => self.toast = None,
@@ -755,7 +1003,7 @@ impl App {
                 secure_storage,
             } => {
                 self.secure_available = secure_storage;
-                self.config = config.clone();
+                self.config = (*config).clone();
                 self.draft = SettingsDraft::from_config(&config);
                 self.refresh_secure_storage();
                 if self.apple_id.is_empty() {
@@ -763,6 +1011,7 @@ impl App {
                 }
                 if let Some(status) = status {
                     self.signed_in = status.state != SyncState::LoginRequired;
+                    self.last_notice_seq = status.notice_seq;
                     self.push_status_to_tray(&status);
                     self.status = Some(status);
                 }
@@ -772,6 +1021,25 @@ impl App {
             WorkerEvent::Status(status) => {
                 if status.state == SyncState::LoginRequired {
                     self.signed_in = false;
+                }
+                // Engine warnings (e.g. "remote parent … not uploaded yet")
+                // arrive on the status document; notify once per sequence.
+                if status.notice_seq > self.last_notice_seq {
+                    self.last_notice_seq = status.notice_seq;
+                    if let Some(notice) = &status.notice {
+                        self.log(LogLevel::Warning, notice.clone());
+                        self.toast(LogLevel::Warning, notice.clone());
+                    }
+                }
+                // A terminal error is worth a notification even when it has no
+                // dedicated `notice` entry.
+                if status.state == SyncState::Error {
+                    if self.last_error_message.as_deref() != Some(status.message.as_str()) {
+                        self.last_error_message = Some(status.message.clone());
+                        self.toast(LogLevel::Error, status.message.clone());
+                    }
+                } else {
+                    self.last_error_message = None;
                 }
                 let label = state_label(&status.state);
                 if self.last_state.as_deref() != Some(label) {
@@ -800,6 +1068,10 @@ impl App {
                 });
                 self.page = Page::Setup;
                 self.toast(LogLevel::Warning, "Two-factor verification required.");
+                if let Some(tray) = &self.tray {
+                    tray.set_verification_required();
+                }
+                return self.open_verification_window();
             }
             WorkerEvent::SignedIn => {
                 self.auth_busy = false;
@@ -809,6 +1081,7 @@ impl App {
                 self.auth_error = None;
                 self.page = Page::Dashboard;
                 self.toast(LogLevel::Success, "Signed in successfully.");
+                return self.close_verification_window();
             }
             WorkerEvent::SyncStarted => self.log(LogLevel::Info, "Sync started"),
             WorkerEvent::SyncFinished => {
@@ -835,6 +1108,7 @@ impl App {
                 self.apple_id.clear();
                 self.status = None;
                 self.toast(LogLevel::Success, "Session forgotten.");
+                return self.close_verification_window();
             }
             WorkerEvent::Relocated { moved, destination } => {
                 self.pending_relocation = None;
@@ -920,14 +1194,22 @@ impl App {
         });
 
         let mut nav = column![].spacing(6).padding([SPACE_LARGE, SPACE]);
-        let pages: &[Page] = if self.signed_in {
-            &[Page::Dashboard, Page::Settings, Page::Activity, Page::About]
+        let pages: Vec<Page> = if self.signed_in {
+            vec![Page::Dashboard, Page::Activity, Page::Settings, Page::About]
         } else {
-            &[Page::Setup, Page::Settings, Page::Activity, Page::About]
+            vec![
+                Page::Setup,
+                Page::Dashboard,
+                Page::Activity,
+                Page::Settings,
+                Page::About,
+            ]
         };
-        for &page in pages {
+        for &page in &pages {
             let label = page.label();
-            let style = if self.page == page {
+            // The active page is highlighted; the Sign-in page (first when
+            // signed out) is the only other styled entry, keeping it distinct.
+            let style = if page == self.page {
                 theme::primary_button
             } else {
                 theme::secondary_button
@@ -964,6 +1246,12 @@ impl App {
             text(format!("Secure storage\n{}", self.secure_storage))
                 .size(11)
                 .color(theme::text_muted(dark)),
+        );
+        nav = nav.push(
+            button(text("⏻  Quit IC-SYNC").size(13))
+                .width(iced::Fill)
+                .on_press(Message::QuitApp)
+                .style(theme::danger_button),
         );
 
         let sidebar = container(nav)
@@ -1022,6 +1310,16 @@ impl LogLevel {
             LogLevel::Success => "✓",
             LogLevel::Warning => "!",
             LogLevel::Error => "×",
+        }
+    }
+
+    /// Full name used by the Activity page's export header and files.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogLevel::Info => "Info",
+            LogLevel::Success => "Success",
+            LogLevel::Warning => "Warning",
+            LogLevel::Error => "Error",
         }
     }
 }

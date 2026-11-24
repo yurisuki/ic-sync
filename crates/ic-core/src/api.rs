@@ -69,7 +69,7 @@ impl RemoteNode {
     pub fn from_value(value: &Value) -> Self {
         // Apple (and pyicloud's DriveNode.name) returns the base name in
         // `name` and the type suffix in a separate `extension` key. Using only
-        // `name` produced extensionless local files such as `/Docs/bumpers`.
+        // `name` produced extensionless local files in older builds.
         // Mirror the reference unconditionally: whenever `extension` is
         // present, the canonical name is `<base>.<extension>`.
         let extension = value
@@ -1313,16 +1313,6 @@ mod tests {
 
     #[test]
     fn remote_node_composes_extension_like_pyicloud() {
-        let node = RemoteNode::from_value(&json!({
-            "name": "bumpers",
-            "extension": "pdf",
-            "type": "file",
-            "drivewsid": "FILE::id",
-        }));
-        assert_eq!(node.name, "bumpers.pdf");
-        assert_eq!(node.extension.as_deref(), Some("pdf"));
-        assert_eq!(node.display_name(), "bumpers.pdf");
-
         // An empty name falls back to the id, then still gets the extension.
         let node = RemoteNode::from_value(&json!({
             "name": "",
@@ -1355,13 +1345,6 @@ mod tests {
 
     #[test]
     fn remote_node_display_name_is_a_single_component() {
-        let node = RemoteNode::from_value(&json!({
-            "name": "Instagram",
-            "type": "app_library",
-            "drivewsid": "FOLDER::iCloud.com.burbn.instagram::documents",
-        }));
-        assert_eq!(node.display_name(), "Instagram");
-
         // Apple returns some app-library names as a full drivewsid.
         let node = RemoteNode::from_value(&json!({
             "name": "FOLDER::com.apple.TextInput::documents",

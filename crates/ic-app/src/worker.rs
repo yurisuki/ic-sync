@@ -84,7 +84,7 @@ pub enum GuiMessage {
 #[derive(Clone, Debug)]
 pub enum WorkerEvent {
     Bootstrapped {
-        config: Config,
+        config: Box<Config>,
         status: Option<ServiceStatus>,
         secure_storage: bool,
     },
@@ -380,7 +380,7 @@ impl Worker {
         let mut view = config.clone();
         view.password.clear();
         self.emit(WorkerEvent::Bootstrapped {
-            config: view,
+            config: Box::new(view),
             status,
             secure_storage: self.secure_storage,
         });

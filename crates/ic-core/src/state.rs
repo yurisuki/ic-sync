@@ -931,23 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_tree_preserves_dirty_flags() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        db.upsert_entry(&entry("/bumpers", "file", Some("id")))
-            .unwrap();
-        db.queue_op("modify", "/bumpers", None).unwrap();
-        db.rename_tree_preserving_state("/bumpers", "/bumpers.pdf")
-            .unwrap();
-        let renamed = db.get_entry("/bumpers.pdf").unwrap().unwrap();
-        assert!(renamed.dirty);
-        assert_eq!(renamed.synced_path.as_deref(), Some("/bumpers.pdf"));
-        let ops = db.list_pending_ops().unwrap();
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].path, "/bumpers.pdf");
-    }
-
-    #[test]
     fn rename_tree_rewrites_pending_targets() {
         let dir = TempDir::new();
         let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();

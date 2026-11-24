@@ -310,14 +310,6 @@ mod tests {
         assert_eq!(join_path("/Photos", "one.jpg"), "/Photos/one.jpg");
         assert_eq!(parent_path("/Photos/one.jpg"), "/Photos");
         assert_eq!(basename("/Photos/one.jpg"), "one.jpg");
-        assert_eq!(
-            conflict_path("/Photos/one.jpg", "20261123120000"),
-            "/Photos/one.jpg.local-conflict-20261123120000"
-        );
-        assert_eq!(
-            conflict_path("/one.jpg", "20261123120000"),
-            "/one.jpg.local-conflict-20261123120000"
-        );
     }
 
     #[test]

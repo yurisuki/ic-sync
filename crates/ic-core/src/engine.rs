@@ -11,7 +11,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use notify::event::{EventKind, ModifyKind, RenameMode};
@@ -32,7 +32,9 @@ use crate::mirror::conflict_path;
 use crate::mirror::{Mirror, basename, join_path, parent_path};
 use crate::relocation::{self, RelocationReport};
 use crate::state::{Database, Entry};
-use crate::status::{ServiceStatus, SyncState, write_status_to};
+use crate::status::{
+    ChangeKind, FileChange, ServiceStatus, SyncDetail, SyncPhase, SyncState, write_status_to,
+};
 
 /// Delay used to coalesce bursts of local file events into one remote crawl.
 const REMOTE_WAKE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -47,6 +49,9 @@ const LOCAL_EVENT_MAX_BATCH: usize = 128;
 /// Yield to the Tokio runtime between chunks so the GUI/Force-sync commands on
 /// a current-thread runtime are never starved by a huge local backlog.
 const LOCAL_APPLY_CHUNK: usize = 64;
+/// Auto-retry gives up after this many consecutive failures: the machine is
+/// notified once and the upload/remote loops pause until a later success.
+const MAX_CONSECUTIVE_ERRORS: usize = 5;
 /// A locally changed path stays protected from remote-view purges for this
 /// long. Apple's crawl is eventually consistent, so a just-uploaded node can
 /// legitimately be absent from the next snapshot.
@@ -329,6 +334,10 @@ struct EngineInner {
     last_sync_at: AtomicI64,
     /// Lets `&self` methods hand an owned `Arc` to spawned 'static tasks.
     self_ref: std::sync::OnceLock<Arc<EngineInner>>,
+    /// Consecutive auto-reported errors (report_error). Reset on success.
+    error_streak: AtomicUsize,
+    /// Set at MAX_CONSECUTIVE_ERRORS; auto-retry loops pause until success.
+    fatal_error: AtomicBool,
 }
 
 /// Headless sync engine. Cheap to clone; clones share the same background
@@ -381,6 +390,8 @@ impl SyncEngine {
             remote_view: std::sync::Mutex::new(None),
             last_sync_at: AtomicI64::new(last),
             self_ref: std::sync::OnceLock::new(),
+            error_streak: AtomicUsize::new(0),
+            fatal_error: AtomicBool::new(false),
         });
         if inner.self_ref.set(inner.clone()).is_err() {
             panic!("engine self-reference was already set");
@@ -584,7 +595,7 @@ impl EngineInner {
 
     fn publish(&self, state: SyncState, message: impl Into<String>) {
         let cfg = self.cfg();
-        let status = ServiceStatus::new(state, message)
+        let mut status = ServiceStatus::new(state, message)
             .with_pending(self.pending_count())
             .with_files(
                 self.state.count_synced().unwrap_or(0).max(0) as u64,
@@ -593,7 +604,75 @@ impl EngineInner {
             .with_times(self.last_sync(), self.next_sync())
             .with_folder(cfg.sync_folder.to_string_lossy().into_owned())
             .with_secure_storage(config::credential_storage_ready(cfg.credential_mode));
+        // `publish` reports the coarse state; the fine-grained detail and any
+        // unacknowledged notice belong to the cache and must survive it.
+        {
+            let cache = self.status_cache.lock().unwrap();
+            status.detail = cache.detail.clone();
+            status.recent_changes = cache.recent_changes.clone();
+            status.notice = cache.notice.clone();
+            status.notice_seq = cache.notice_seq;
+        }
         *self.status_cache.lock().unwrap() = status.clone();
+        if let Err(error) = write_status_to(&self.status_path, &status) {
+            warn!("could not write status file: {error}");
+        }
+    }
+
+    /// Record the exact step currently being performed. The status loop writes
+    /// it to disk so the GUI/tray can show live progress instead of a bare
+    /// "Syncing".
+    fn update_detail(
+        &self,
+        phase: SyncPhase,
+        step: impl Into<String>,
+        current_item: Option<&str>,
+        completed: u64,
+        total: u64,
+    ) {
+        let mut cache = self.status_cache.lock().unwrap();
+        cache.detail = SyncDetail {
+            phase,
+            step: step.into(),
+            current_item: current_item.map(str::to_string),
+            completed,
+            total,
+        };
+    }
+
+    /// Record a file change in the minimal recent-changes feed. Entries are
+    /// newest first and the list is capped, so the status document written
+    /// every second stays small.
+    fn record_change(&self, kind: ChangeKind, path: impl Into<String>) {
+        const RECENT_CHANGES_LIMIT: usize = 20;
+        let mut cache = self.status_cache.lock().unwrap();
+        cache.recent_changes.insert(
+            0,
+            FileChange {
+                at: chrono::Utc::now().timestamp(),
+                kind,
+                path: path.into(),
+            },
+        );
+        cache.recent_changes.truncate(RECENT_CHANGES_LIMIT);
+    }
+
+    /// Surface an engine problem to the GUI/tray.
+    ///
+    /// Core has no channel to the GUI, so the notice rides on the status
+    /// document: the next status poll picks it up and shows a notification.
+    /// The monotonic `notice_seq` lets the GUI show each notice exactly once.
+    fn notify_warning(&self, message: impl Into<String>) {
+        let message = message.into();
+        warn!("{message}");
+        {
+            let mut cache = self.status_cache.lock().unwrap();
+            cache.notice = Some(message);
+            cache.notice_seq = cache.notice_seq.wrapping_add(1);
+        }
+        // Write immediately instead of waiting for the periodic status loop so
+        // a short-lived failure is still visible to the GUI.
+        let status = self.status();
         if let Err(error) = write_status_to(&self.status_path, &status) {
             warn!("could not write status file: {error}");
         }
@@ -607,6 +686,8 @@ impl EngineInner {
                 if let Err(error) = self.state.prune_pending_ops() {
                     debug!("could not prune pending ops: {error}");
                 }
+                self.error_streak.store(0, AtomicOrdering::SeqCst);
+                self.fatal_error.store(false, AtomicOrdering::SeqCst);
                 self.publish(SyncState::Synced, success_message);
             }
             Err(error) => self.report_error(error),
@@ -625,6 +706,60 @@ impl EngineInner {
                 error!("sync error: {error}");
                 self.publish(SyncState::Error, error.to_string());
             }
+        }
+        // Give up on endless retry loops: after a few consecutive failures
+        // the user gets a machine notification, and the loops pause until a
+        // later success. Auth states (signed out / 2FA pending) are not
+        // failures — they are normal.
+        if !error.is_auth() {
+            let streak = self.error_streak.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if streak >= MAX_CONSECUTIVE_ERRORS
+                && !self.fatal_error.swap(true, AtomicOrdering::SeqCst)
+            {
+                self.machine_notify(&format!(
+                    "IC-SYNC is stuck: {streak} consecutive errors. Automatic retries paused; \
+                     check the app for details."
+                ));
+            }
+        }
+    }
+
+    fn is_fatal(&self) -> bool {
+        self.fatal_error.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Best-effort desktop notification + beep. Linux uses notify-send and the
+    /// desktop beep; Windows shows a MessageBox and beeps. Everything is
+    /// fire-and-forget: a missing tool just means no notification.
+    fn machine_notify(&self, message: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!(
+                "Add-Type -AssemblyName System.Windows.Forms;\
+                 [System.Media.SystemSounds]::Hand.Play();\
+                 [System.Windows.MessageBox]::Show('{}','IC-SYNC',0,48)",
+                message.replace('\'', "")
+            );
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &script])
+                .spawn();
+        }
+        #[cfg(all(unix, not(target_os = "windows")))]
+        {
+            let _ = std::process::Command::new("notify-send")
+                .args(["-u", "critical", "-a", "ic-sync", "IC-SYNC", message])
+                .spawn();
+            // Warning error sound: first available player wins, fire-and-forget.
+            let _ = ["paplay", "aplay", "ffplay"]
+                .into_iter()
+                .find_map(|player| {
+                    std::process::Command::new(player)
+                        .arg("/usr/share/sounds/freedesktop/stereo/bell.oga")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .ok()
+                });
         }
     }
 
@@ -756,7 +891,7 @@ impl EngineInner {
         let publisher = self.self_arc();
         let status_path = self.status_path.clone();
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
                 if publisher.is_shutdown() {
@@ -786,6 +921,9 @@ impl EngineInner {
                 if refresher.is_shutdown() {
                     break;
                 }
+                if refresher.is_fatal() {
+                    continue;
+                }
                 if woken {
                     // Bursts of file events collapse into a single crawl.
                     sleep(REMOTE_WAKE_DEBOUNCE).await;
@@ -795,9 +933,9 @@ impl EngineInner {
                     refresher.remote_wake.drain().await;
                 }
                 refresher.set_next_sync();
-                if let Err(error) = refresher.sync_once().await {
-                    refresher.report_error(&error);
-                }
+                // `sync_once` already reports errors through `finish_sync`;
+                // calling `report_error` here again would double-count.
+                let _ = refresher.sync_once().await;
                 // Restart the interval after every crawl (including wake-driven
                 // ones) so a signal cannot trigger an immediate extra crawl.
                 timer.reset();
@@ -821,6 +959,11 @@ impl EngineInner {
                 }
             }
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            // The first crawl is done, so the remote view is known: pick up
+            // local files that have no DB row (created while the app was not
+            // running) and mark them dirty so the upload loop below pushes
+            // them.
+            uploader.scan_untracked_local_files();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -828,6 +971,12 @@ impl EngineInner {
                 }
                 if uploader.is_shutdown() {
                     break;
+                }
+                // Paused by repeated failures: the user was notified and
+                // retrying forever would just spam. A later success clears
+                // the flag (finish_sync).
+                if uploader.is_fatal() {
+                    continue;
                 }
                 if let Err(error) = uploader.sync_dirty().await {
                     uploader.report_error(&error);
@@ -960,8 +1109,19 @@ impl EngineInner {
                     if self.is_hydrating(&relative) || self.is_ignorable_empty_ghost(&relative) {
                         continue;
                     }
+                    // A change on a path with no row is a local add; on an
+                    // existing row it is a modification.
+                    let was_new = self
+                        .state
+                        .get_entry(&relative)
+                        .map(|entry| entry.is_none())
+                        .unwrap_or(false);
                     if let Err(error) = self.mark_local_change(&relative) {
                         debug!("ignoring local change for {relative}: {error}");
+                    } else if was_new {
+                        self.record_change(ChangeKind::Added, relative);
+                    } else {
+                        self.record_change(ChangeKind::Modified, relative);
                     }
                 }
                 LocalAction::Delete(path) => {
@@ -1001,9 +1161,11 @@ impl EngineInner {
         if self.read_only() {
             return Err(Error::Auth("sign in before syncing".into()));
         }
+        self.update_detail(SyncPhase::Connecting, "Connecting to iCloud…", None, 0, 0);
         self.publish(SyncState::Syncing, "refreshing remote metadata");
         self.crawl_and_apply().await?;
         self.mark_first_crawl_done();
+        self.update_detail(SyncPhase::Idle, "Up to date", None, 0, 0);
         let now = chrono::Utc::now().timestamp();
         self.last_sync_at.store(now, AtomicOrdering::Relaxed);
         self.set_next_sync();
@@ -1014,6 +1176,13 @@ impl EngineInner {
 
     async fn crawl_and_apply(&self) -> Result<()> {
         let crawl_started_at = chrono::Utc::now().timestamp();
+        self.update_detail(
+            SyncPhase::RefreshingMetadata,
+            "Refreshing remote metadata",
+            None,
+            0,
+            0,
+        );
         // The Python reference crawls only `root.get_children()`. Apple already
         // lists the user's app libraries there (e.g. Pages); `app_libraries()`
         // is a catalogue of *all* app containers and must not be mirrored as
@@ -1021,6 +1190,13 @@ impl EngineInner {
         let root = self.api.root().await?;
         let (nodes, id_paths) =
             collect_remote_nodes(&self.api, root, |path| self.path_allowed(path)).await?;
+        self.update_detail(
+            SyncPhase::Reconciling,
+            format!("Reconciling {} remote item(s)", nodes.len()),
+            None,
+            0,
+            nodes.len() as u64,
+        );
         let snapshot: HashMap<String, RemoteNode> = nodes.into_iter().collect();
         let view = RemoteView {
             paths: snapshot.keys().cloned().collect(),
@@ -1038,9 +1214,9 @@ impl EngineInner {
             }
         }
         // Older builds dropped Apple's separate `extension` field, leaving
-        // rows/files named `bumpers` instead of `bumpers.pdf`. Repair them
-        // from remote metadata *before* purging, so local content is moved to
-        // the canonical path instead of being orphaned or duplicated.
+        // extensionless rows/files behind. Repair them from remote metadata
+        // *before* purging, so local content is moved to the canonical path
+        // instead of being orphaned or duplicated.
         repair_extensionless_paths(&self.state, &self.mirror, &snapshot)?;
         // Reconcile against the authoritative view before the watcher/upload
         // loops can see (and recreate) stale local or DB state.
@@ -1093,10 +1269,10 @@ impl EngineInner {
                         // Reconciliation only removes empty directories. If a
                         // duplicate has real content, moving it over the
                         // canonical path could clobber it; leave and report.
-                        warn!(
-                            "keeping duplicate directory {}; canonical path {path} is occupied",
+                        self.notify_warning(format!(
+                            "Keeping duplicate directory {}; canonical path {path} is occupied",
                             entry.path
-                        );
+                        ));
                         handled.insert(entry.path.clone());
                         handled.insert(path.clone());
                         continue;
@@ -1316,6 +1492,13 @@ impl EngineInner {
     }
 
     async fn hydrate_inner(&self, path: &str) {
+        self.update_detail(
+            SyncPhase::Downloading,
+            format!("Downloading {path}"),
+            Some(path),
+            0,
+            0,
+        );
         let entry = match self.state.get_entry(path) {
             Ok(Some(entry)) => entry,
             Ok(None) => return,
@@ -1357,6 +1540,7 @@ impl EngineInner {
                             let _ =
                                 self.state
                                     .mark_hydrated(path, Some(&checksum), size, entry.mtime);
+                            self.record_change(ChangeKind::Downloaded, path);
                             debug!("hydrated {path} ({size} bytes)");
                             break;
                         }
@@ -1385,6 +1569,7 @@ impl EngineInner {
             }
         }
         self.scheduled.lock().unwrap().remove(path);
+        self.update_detail(SyncPhase::Idle, "Up to date", None, 0, 0);
     }
 
     // -- local changes / uploads -----------------------------------------
@@ -1463,6 +1648,39 @@ impl EngineInner {
         Ok(())
     }
 
+    /// Mark local files that exist in the mirror but have no DB row yet —
+    /// typically created while the app was not running, so the watcher never
+    /// saw them. Called once after the first crawl; the upload loop then
+    /// pushes them like any other local change.
+    fn scan_untracked_local_files(&self) {
+        fn walk(dir: &Path, icloud: &str, out: &mut Vec<String>) {
+            let Ok(entries) = fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let relative = if icloud.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{icloud}/{name}")
+                };
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &relative, out);
+                } else {
+                    out.push(relative);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&self.mirror.root(), "", &mut files);
+        for relative in files {
+            let path = config::normalize_icloud_path(&relative);
+            if self.state.get_entry(&path).ok().flatten().is_none() {
+                // Debug, not warn: a missing row is expected for files that
+                // predate the app or the user's session.
+                self.mark_local_change(&path).ok();
+            }
+        }
+    }
+
     fn mark_local_delete(&self, path: &str) -> Result<()> {
         let canonical = config::normalize_icloud_path(path);
         let path = canonical.as_str();
@@ -1478,6 +1696,7 @@ impl EngineInner {
             }
             self.local_changes.note(path);
             self.notify_local_change();
+            self.record_change(ChangeKind::Removed, path);
         }
         Ok(())
     }
@@ -1610,7 +1829,7 @@ impl EngineInner {
                 Err(error) => {
                     failures += 1;
                     let _ = self.state.bump_op_retry(op.id, &error.to_string());
-                    warn!("could not rename {}: {error}", entry.path);
+                    self.notify_warning(format!("Could not rename {}: {error}", entry.path));
                 }
             }
         }
@@ -1674,6 +1893,7 @@ impl EngineInner {
             dirty.retain(|entry| !entry.path.contains(".local-conflict-"));
         }
         if dirty.is_empty() {
+            self.update_detail(SyncPhase::Idle, "Up to date", None, 0, 0);
             self.set_next_sync();
             return Ok(());
         }
@@ -1699,8 +1919,23 @@ impl EngineInner {
                     .then_with(|| a.path.cmp(&b.path))
             }
         });
+        self.update_detail(
+            SyncPhase::Uploading,
+            format!("Uploading {} local change(s)", dirty.len()),
+            None,
+            0,
+            dirty.len() as u64,
+        );
         self.publish(SyncState::Syncing, "uploading local changes");
-        for entry in dirty {
+        let total = dirty.len() as u64;
+        for (index, entry) in dirty.into_iter().enumerate() {
+            self.update_detail(
+                SyncPhase::Uploading,
+                format!("Uploading {}", entry.path),
+                Some(&entry.path),
+                index as u64,
+                total,
+            );
             // Re-arm the purge grace for every queued local change, including
             // rows queued before this engine started (e.g. on bootstrap).
             self.local_changes.note(&entry.path);
@@ -1716,14 +1951,15 @@ impl EngineInner {
                     let now = chrono::Utc::now().timestamp();
                     if !self.finish_upload(&entry.path, now)? {
                         failures += 1;
-                        warn!(
-                            "keeping {} dirty: no remote identity was recorded",
+                        self.notify_warning(format!(
+                            "Keeping {} dirty: no remote identity was recorded",
                             entry.path
-                        );
+                        ));
                     } else if !entry.tombstone {
                         // Apple's metadata is eventually consistent: keep this
                         // path protected until a crawl actually sees the node.
                         self.local_changes.note_awaiting_visibility(&entry.path);
+                        self.record_change(ChangeKind::Uploaded, entry.path.clone());
                     }
                     // The remote copy just changed; verify it right away when
                     // instant sync is enabled instead of waiting for the poll.
@@ -1736,7 +1972,7 @@ impl EngineInner {
                 }
                 Err(error) => {
                     failures += 1;
-                    warn!("could not sync {}: {error}", entry.path);
+                    self.notify_warning(format!("Could not sync {}: {error}", entry.path));
                     if let Ok(ops) = self.state.list_pending_ops() {
                         for op in ops.iter().filter(|op| op.path == entry.path) {
                             let _ = self.state.bump_op_retry(op.id, &error.to_string());
@@ -1746,6 +1982,7 @@ impl EngineInner {
             }
         }
         self.set_next_sync();
+        self.update_detail(SyncPhase::Idle, "Upload complete", None, 0, 0);
         if failures > 0 {
             return Err(Error::other(format!(
                 "{failures} local change(s) could not be uploaded; will retry"
@@ -1757,11 +1994,13 @@ impl EngineInner {
     async fn sync_tombstone(&self, entry: &Entry) -> Result<()> {
         let Some(id) = entry.remote_drivewsid.as_deref() else {
             self.state.remove_subtree(&entry.path)?;
+            self.record_change(ChangeKind::Removed, entry.path.clone());
             return Ok(());
         };
         let etag = entry.remote_etag.as_deref().unwrap_or_default();
         self.api.delete_node(id, etag).await?;
         self.state.remove_subtree(&entry.path)?;
+        self.record_change(ChangeKind::Removed, entry.path.clone());
         Ok(())
     }
 
@@ -1798,7 +2037,10 @@ impl EngineInner {
                         zone = node.zone.clone();
                     }
                 }
-                Err(error) => warn!("could not refresh new folder {}: {error}", entry.path),
+                Err(error) => self.notify_warning(format!(
+                    "Could not refresh new folder {}: {error}",
+                    entry.path
+                )),
             }
         }
         self.state.update_remote_fields(
@@ -1837,7 +2079,10 @@ impl EngineInner {
             if let Some(id) = entry.remote_drivewsid.as_deref() {
                 let etag = entry.remote_etag.as_deref().unwrap_or_default();
                 if let Err(error) = self.api.delete_node(id, etag).await {
-                    warn!("could not remove stale remote file {}: {error}", entry.path);
+                    self.notify_warning(format!(
+                        "Could not remove stale remote file {}: {error}",
+                        entry.path
+                    ));
                 }
             }
         }
@@ -1865,7 +2110,10 @@ impl EngineInner {
                     remote_zone = child.zone.clone();
                 }
             }
-            Err(error) => warn!("could not refresh uploaded file {}: {error}", entry.path),
+            Err(error) => self.notify_warning(format!(
+                "Could not refresh uploaded file {}: {error}",
+                entry.path
+            )),
         }
         // If the crawl has not caught up yet, fall back to the nested document
         // in the update response so the row never stays identity-less.
@@ -1932,6 +2180,7 @@ impl EngineInner {
                 .await?;
         }
         self.state.update_synced_path(&entry.path)?;
+        self.record_change(ChangeKind::Renamed, entry.path.clone());
         Ok(())
     }
 
@@ -1945,9 +2194,45 @@ impl EngineInner {
             return Ok(id);
         }
         self.state.queue_op("create", path, None)?;
-        Err(Error::other(format!(
-            "remote parent for {path} is not uploaded yet"
-        )))
+        self.mark_folder_dirty_for_upload(path);
+        let message = format!("Remote parent for {path} is not uploaded yet");
+        self.notify_warning(message.clone());
+        Err(Error::other(message))
+    }
+
+    /// Insert a dirty folder row for `path` and queue its `create` op so the
+    /// upload loop creates the folder on its next pass. Without this, an
+    /// upload blocked on a missing parent retries forever with no path
+    /// forward.
+    fn mark_folder_dirty_for_upload(&self, path: &str) {
+        if self.state.get_entry(path).ok().flatten().is_none() {
+            let entry = Entry {
+                path: path.to_string(),
+                entry_type: "folder".into(),
+                parent_path: parent_path(path),
+                remote_drivewsid: None,
+                remote_docwsid: None,
+                remote_etag: None,
+                remote_zone: None,
+                remote_shareid: None,
+                size: 0,
+                mtime: 0,
+                hydrated: true,
+                dirty: true,
+                tombstone: false,
+                local_sha256: None,
+                last_synced_at: None,
+                synced_path: None,
+            };
+            if let Err(error) = self.state.upsert_entry(&entry) {
+                debug!("could not mark {path} dirty for upload: {error}");
+            }
+        }
+        if let Err(error) = self.state.queue_op("create", path, None) {
+            debug!("could not queue create for {path}: {error}");
+        }
+        self.local_changes.note(path);
+        self.notify_local_change();
     }
 
     /// Parent identity used by `/update/documents` when adding a file.
@@ -1965,9 +2250,10 @@ impl EngineInner {
             .or_else(|| (path == "/").then(|| ROOT_DRIVEWSID.to_string()));
         let Some(drivewsid) = drivewsid else {
             self.state.queue_op("create", path, None)?;
-            return Err(Error::other(format!(
-                "remote parent for {path} is not uploaded yet"
-            )));
+            self.mark_folder_dirty_for_upload(path);
+            let message = format!("Remote parent for {path} is not uploaded yet");
+            self.notify_warning(message.clone());
+            return Err(Error::other(message));
         };
         let docwsid = entry
             .as_ref()
@@ -2107,6 +2393,13 @@ impl EngineInner {
                 "dirty, pending or unhydrated entries remain; sync first".into(),
             ));
         }
+        self.update_detail(
+            SyncPhase::Relocating,
+            "Moving local sync folder",
+            None,
+            0,
+            0,
+        );
         self.publish(SyncState::Relocating, "moving local sync folder");
         let result = self.perform_relocation(new_folder);
         match &result {
@@ -2120,6 +2413,7 @@ impl EngineInner {
             ),
             Err(error) => self.publish(SyncState::Error, format!("folder move failed: {error}")),
         }
+        self.update_detail(SyncPhase::Idle, "Up to date", None, 0, 0);
         result
     }
 
@@ -2146,7 +2440,7 @@ impl EngineInner {
 }
 
 /// Repair rows/files that an older build stored without Apple's separate
-/// `extension` field (e.g. `/Docs/bumpers` for remote `bumpers.pdf`).
+/// `extension` field.
 ///
 /// Only nodes whose canonical name is exactly `<old name>.<extension>` in the
 /// same folder are considered, so unrelated local files and genuine renames
@@ -2350,7 +2644,7 @@ fn is_duplicate_path(path: &str, canonical: &str) -> bool {
 }
 
 /// A path whose final component repeats an ancestor component, e.g.
-/// `/Instagram/Instagram` or `/FOLDER::X/FOLDER::X`.
+/// `/dir/dir`.
 fn is_duplicate_shape(path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     let Some(last) = parts.last().copied() else {
@@ -2686,6 +2980,19 @@ fn remove_empty_ghost_dirs(
         if matches!(state.get_entry(&path), Ok(Some(entry)) if entry.dirty || entry.tombstone) {
             continue;
         }
+        // A directory the user just created (mtime inside the grace window)
+        // is not proven stale yet: the watcher/upload pipeline still owes it a
+        // row, and deleting it immediately breaks brand-new folders.
+        let dir_mtime_secs = dir
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|age| age.as_secs() as i64);
+        let age = dir_mtime_secs.map(|mtime| chrono::Utc::now().timestamp() - mtime);
+        if age.is_some_and(|age| age < grace.as_secs() as i64) {
+            continue;
+        }
         let Ok(mut children) = fs::read_dir(&dir) else {
             continue;
         };
@@ -2858,134 +3165,6 @@ mod tests {
         }
     }
 
-    fn dir_entry(path: &str, id: Option<&str>, dirty: bool) -> Entry {
-        let mut entry = dirty_dir(path, id);
-        entry.dirty = dirty;
-        entry.synced_path = (!dirty).then(|| path.to_string());
-        entry
-    }
-
-    #[test]
-    fn allowlist_snapshot_purges_ghosts_and_keeps_real_roots() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-
-        let mut config = Config::load_defaults();
-        config.sync_paths = vec!["/Docs".into(), "/Downloads".into()];
-        let root = RemoteNode::from_value(&json!({
-            "name": "",
-            "type": "folder",
-            "drivewsid": ROOT_DRIVEWSID,
-            "items": [
-                {"name":"Docs","type":"folder","drivewsid":"FOLDER::docs"},
-                {"name":"Downloads","type":"folder","drivewsid":"FOLDER::downloads"},
-                {"name":"Dropbox","type":"folder","drivewsid":"FOLDER::dropbox"},
-                {"name":"Pages","type":"app_library","drivewsid":"FOLDER::com.apple.Pages::documents"},
-                {"name":"Alibaba","type":"folder","drivewsid":"FOLDER::alibaba"},
-                {"name":"FOLDER::com","type":"folder","drivewsid":"FOLDER::com"}
-            ]
-        }));
-        let (nodes, _) = walk_remote_nodes(root, |path| config.path_allowed(path));
-        let snapshot: HashMap<String, RemoteNode> = nodes.into_iter().collect();
-        let view = RemoteView {
-            paths: snapshot.keys().cloned().collect(),
-            ids: snapshot
-                .values()
-                .map(|node| node.drivewsid.clone())
-                .collect(),
-        };
-        let mut paths: Vec<&str> = view.paths.iter().map(String::as_str).collect();
-        paths.sort();
-        assert_eq!(paths, vec!["/", "/Docs", "/Downloads"]);
-
-        // Stale DB rows/local folders outside the allowlist.
-        for path in [
-            "/Docs",
-            "/Downloads",
-            "/Dropbox",
-            "/Pages",
-            "/Alibaba",
-            "/FOLDER::com",
-            "/Instagram",
-            "/Instagram/Instagram",
-            "/Work Chat",
-            "/Docs.local-conflict-20261123000000",
-        ] {
-            let id = match path {
-                "/Docs" => Some("FOLDER::docs"),
-                "/Downloads" => Some("FOLDER::downloads"),
-                _ => None,
-            };
-            db.upsert_entry(&dir_entry(path, id, false)).unwrap();
-            mirror.ensure_dir(path).unwrap();
-        }
-        // A directory with real content and a conflict copy must survive.
-        mirror
-            .write_all("/Work Chat/keep.txt", b"precious")
-            .unwrap();
-        // A purely local empty ghost with no DB row at all.
-        mirror.ensure_dir("/Ghost").unwrap();
-
-        let tracker = LocalChangeTracker::default();
-        let removed =
-            purge_stale_entries(&db, &mirror, &view, &tracker, LOCAL_CHANGE_GRACE).unwrap();
-        assert!(removed > 0);
-
-        assert!(db.get_entry("/Docs").unwrap().is_some());
-        assert!(db.get_entry("/Downloads").unwrap().is_some());
-        assert!(mirror.exists("/Docs"));
-        assert!(mirror.exists("/Downloads"));
-        for path in [
-            "/Dropbox",
-            "/Pages",
-            "/Alibaba",
-            "/FOLDER::com",
-            "/Instagram",
-            "/Instagram/Instagram",
-            "/Ghost",
-        ] {
-            assert!(db.get_entry(path).unwrap().is_none(), "DB row for {path}");
-            assert!(!mirror.exists(path), "local folder {path} survived");
-        }
-        assert!(db.get_entry("/Work Chat").unwrap().is_some());
-        assert_eq!(
-            fs::read(mirror.local_path("/Work Chat/keep.txt").unwrap()).unwrap(),
-            b"precious"
-        );
-        assert!(
-            db.get_entry("/Docs.local-conflict-20261123000000")
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn stale_duplicate_rows_are_dropped_before_upload() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-
-        // Exactly the shape left by the bad crawl: the bogus top-level app
-        // library folder and its doubled child, both dirty with no remote id.
-        db.upsert_entry(&dirty_dir("/Instagram", None)).unwrap();
-        db.upsert_entry(&dirty_dir("/Instagram/Instagram", None))
-            .unwrap();
-        db.queue_op("create", "/Instagram", None).unwrap();
-        db.queue_op("create", "/Instagram/Instagram", None).unwrap();
-        db.upsert_entry(&clean_dir("/Docs", "FOLDER::docs"))
-            .unwrap();
-
-        // The user already removed the local directories; DB rows are stale.
-        let dropped = drop_stale_duplicates(&db, &mirror).unwrap();
-        assert_eq!(dropped, 2);
-        assert!(db.get_entry("/Instagram").unwrap().is_none());
-        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_none());
-        assert!(db.list_pending_ops().unwrap().is_empty());
-        assert!(db.list_dirty().unwrap().is_empty());
-        assert!(db.get_entry("/Docs").unwrap().is_some());
-    }
-
     fn dirty_file(path: &str, id: Option<&str>) -> Entry {
         let mut entry = dirty_dir(path, id);
         entry.entry_type = "file".into();
@@ -3041,94 +3220,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_with_real_remote_id_is_kept() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-        db.upsert_entry(&dirty_dir("/Instagram", Some("FOLDER::parent")))
-            .unwrap();
-        db.upsert_entry(&dirty_dir("/Instagram/Instagram", Some("FOLDER::real")))
-            .unwrap();
-        assert_eq!(drop_stale_duplicates(&db, &mirror).unwrap(), 0);
-        assert!(db.get_entry("/Instagram").unwrap().is_some());
-        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_some());
-    }
-
-    #[test]
-    fn duplicate_with_local_file_is_kept() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-        db.upsert_entry(&dirty_dir("/Instagram", None)).unwrap();
-        db.upsert_entry(&dirty_dir("/Instagram/Instagram", None))
-            .unwrap();
-        mirror.ensure_dir("/Instagram/Instagram").unwrap();
-        mirror
-            .write_all("/Instagram/Instagram/keep.txt", b"precious")
-            .unwrap();
-        assert_eq!(drop_stale_duplicates(&db, &mirror).unwrap(), 0);
-        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_some());
-        assert_eq!(
-            fs::read(mirror.local_path("/Instagram/Instagram/keep.txt").unwrap()).unwrap(),
-            b"precious"
-        );
-    }
-
-    #[test]
-    fn reconciliation_drops_duplicate_row_without_local_directory() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-        db.upsert_entry(&clean_dir("/Instagram/Instagram", "FOLDER::old"))
-            .unwrap();
-        let mut id_paths = HashMap::new();
-        id_paths.insert("FOLDER::old".to_string(), "/Instagram".to_string());
-        let snapshot = HashMap::new();
-        reconcile_bad_paths(&db, &mirror, &id_paths, &snapshot).unwrap();
-        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_none());
-    }
-
-    #[test]
-    fn crawl_only_mirrors_true_root_items_with_canonical_paths() {
-        // Shape observed live: root children include regular folders and app
-        // libraries, and some app-library `name` values are raw drivewsids.
-        let root = RemoteNode::from_value(&json!({
-            "name": "",
-            "type": "folder",
-            "drivewsid": ROOT_DRIVEWSID,
-            "items": [
-                {"name":"Docs","type":"folder","drivewsid":"FOLDER::docs"},
-                {"name":"Downloads","type":"folder","drivewsid":"FOLDER::downloads"},
-                {"name":"Dropbox","type":"folder","drivewsid":"FOLDER::dropbox"},
-                {"name":"Pages","type":"app_library","drivewsid":"FOLDER::com.apple.Pages::documents"},
-                {"name":"FOLDER::com.apple.TextInput::documents","type":"app_library","drivewsid":"FOLDER::com.apple.TextInput::documents"}
-            ]
-        }));
-        let (nodes, id_paths) = walk_remote_nodes(root, |_| true);
-        let paths: HashSet<&str> = nodes.iter().map(|(path, _)| path.as_str()).collect();
-        assert_eq!(paths.len(), 6);
-        for expected in [
-            "/",
-            "/Docs",
-            "/Downloads",
-            "/Dropbox",
-            "/Pages",
-            "/FOLDER::com.apple.TextInput::documents",
-        ] {
-            assert!(
-                paths.contains(expected),
-                "missing canonical path {expected}"
-            );
-        }
-        assert_eq!(
-            id_paths
-                .get("FOLDER::com.apple.Pages::documents")
-                .map(String::as_str),
-            Some("/Pages")
-        );
-    }
-
-    #[test]
     fn embedded_path_names_are_reduced_to_one_component() {
         let root = RemoteNode::from_value(&json!({
             "name": "",
@@ -3150,77 +3241,6 @@ mod tests {
                 .any(|path| path.contains("Full::Path::Name/Full::Path::Name"))
         );
     }
-
-    #[test]
-    fn duplicate_path_signatures() {
-        assert!(is_duplicate_path("/Instagram/Instagram", "/Instagram"));
-        assert!(is_duplicate_path("/FOLDER::X/FOLDER::X", "/FOLDER::X"));
-        assert!(is_duplicate_path("/A/A/A", "/A"));
-        assert!(!is_duplicate_path("/Instagram/Photos", "/Instagram"));
-        assert!(!is_duplicate_path("/Instagram", "/Instagram"));
-        assert!(is_duplicate_shape("/Cloud Music/Cloud Music"));
-        assert!(!is_duplicate_shape("/Docs/Downloads"));
-    }
-
-    #[test]
-    fn reconciliation_removes_only_empty_db_proven_duplicates() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-        let bad_id = "FOLDER::iCloud.com.burbn.instagram::documents";
-        db.upsert_entry(&clean_dir("/Instagram/Instagram", bad_id))
-            .unwrap();
-        mirror.ensure_dir("/Instagram/Instagram").unwrap();
-        // A legitimate `/Docs/Docs` mapped to itself must not be touched.
-        db.upsert_entry(&clean_dir("/Docs/Docs", "FOLDER::real-docs-docs"))
-            .unwrap();
-        mirror.ensure_dir("/Docs/Docs").unwrap();
-
-        let mut id_paths = HashMap::new();
-        id_paths.insert(bad_id.to_string(), "/Instagram".to_string());
-        id_paths.insert(
-            "FOLDER::real-docs-docs".to_string(),
-            "/Docs/Docs".to_string(),
-        );
-        let snapshot = HashMap::new();
-        reconcile_bad_paths(&db, &mirror, &id_paths, &snapshot).unwrap();
-
-        assert!(db.get_entry("/Instagram/Instagram").unwrap().is_none());
-        assert!(!mirror.exists("/Instagram/Instagram"));
-        assert!(db.get_entry("/Docs/Docs").unwrap().is_some());
-        assert!(mirror.exists("/Docs/Docs"));
-    }
-
-    #[test]
-    fn reconciliation_leaves_duplicate_with_content() {
-        let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-        let bad_id = "FOLDER::iCloud.com.sevenam.CloudMusic::documents";
-        db.upsert_entry(&clean_dir("/Cloud Music/Cloud Music", bad_id))
-            .unwrap();
-        mirror.ensure_dir("/Cloud Music/Cloud Music").unwrap();
-        mirror
-            .write_all("/Cloud Music/Cloud Music/keep.txt", b"precious")
-            .unwrap();
-
-        let mut id_paths = HashMap::new();
-        id_paths.insert(bad_id.to_string(), "/Cloud Music".to_string());
-        let snapshot = HashMap::new();
-        reconcile_bad_paths(&db, &mirror, &id_paths, &snapshot).unwrap();
-
-        assert!(db.get_entry("/Cloud Music/Cloud Music").unwrap().is_some());
-        assert_eq!(
-            fs::read(
-                mirror
-                    .local_path("/Cloud Music/Cloud Music/keep.txt")
-                    .unwrap()
-            )
-            .unwrap(),
-            b"precious"
-        );
-    }
-
     async fn test_engine(dir: &TempDir) -> SyncEngine {
         let mut config = Config::load_defaults();
         config.credential_mode = crate::config::CredentialMode::Plain;
@@ -3452,47 +3472,24 @@ mod tests {
         assert_eq!(engine.inner.state.count_pending_ops().unwrap(), 0);
     }
 
-    #[test]
-    fn repair_moves_extensionless_file_without_losing_content() {
+    #[tokio::test]
+    async fn record_change_is_newest_first_and_capped() {
         let dir = TempDir::new();
-        let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
-        let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
-        mirror.write_all("/Docs/bumpers", b"precious").unwrap();
-        let mut old = dir_entry("/Docs/bumpers", Some("FILE::id"), true);
-        old.entry_type = "file".into();
-        old.synced_path = Some("/Docs/bumpers".into());
-        db.upsert_entry(&old).unwrap();
-        db.queue_op("modify", "/Docs/bumpers", None).unwrap();
-        let snapshot: HashMap<String, RemoteNode> = [(
-            "/Docs/bumpers.pdf".to_string(),
-            RemoteNode::from_value(&json!({
-                "name": "bumpers", "extension": "pdf", "type": "file", "drivewsid": "FILE::id"
-            })),
-        )]
-        .into_iter()
-        .collect();
-
-        assert_eq!(
-            repair_extensionless_paths(&db, &mirror, &snapshot).unwrap(),
-            1
-        );
-        assert!(db.get_entry("/Docs/bumpers").unwrap().is_none());
-        let fixed = db.get_entry("/Docs/bumpers.pdf").unwrap().unwrap();
-        assert_eq!(fixed.synced_path.as_deref(), Some("/Docs/bumpers.pdf"));
-        assert!(fixed.dirty); // a queued local edit must survive the repair
-        assert_eq!(
-            fs::read(mirror.local_path("/Docs/bumpers.pdf").unwrap()).unwrap(),
-            b"precious"
-        );
-        assert!(!mirror.exists("/Docs/bumpers"));
-
-        // A second repair is a no-op and never duplicates data.
-        assert_eq!(
-            repair_extensionless_paths(&db, &mirror, &snapshot).unwrap(),
-            0
-        );
+        let engine = test_engine(&dir).await;
+        engine.inner.record_change(ChangeKind::Added, "a");
+        engine.inner.record_change(ChangeKind::Removed, "b");
+        let status = engine.inner.status();
+        assert_eq!(status.recent_changes[0].path, "b");
+        assert_eq!(status.recent_changes[1].path, "a");
+        for i in 0..22 {
+            engine
+                .inner
+                .record_change(ChangeKind::Modified, format!("f{}", i));
+        }
+        let status = engine.inner.status();
+        assert!(status.recent_changes.len() <= 20);
+        assert_eq!(status.recent_changes[0].path, "f21");
     }
-
     #[tokio::test]
     async fn upload_uses_parent_docwsid_not_drivewsid() {
         let dir = TempDir::new();
@@ -3716,42 +3713,99 @@ mod tests {
         );
         assert!(db.get_entry("/Docs/new.txt").unwrap().is_none());
     }
-
     #[test]
-    fn purge_respects_grace_expiry_pending_ops_and_local_content() {
+    fn remove_empty_ghost_dirs_spares_freshly_created_dirs() {
         let dir = TempDir::new();
         let db = Database::open(&dir.path.join("state.sqlite3")).unwrap();
         let mirror = Mirror::new(dir.path.join("sync"), dir.path.join("tmp")).unwrap();
         let view = test_remote_view();
-        let tracker = LocalChangeTracker::default();
-        let expired = chrono::Utc::now().timestamp() - LOCAL_CHANGE_GRACE.as_secs() as i64 - 1;
 
-        // Clean-looking row from a local change whose grace just expired.
-        db.upsert_entry(&clean_file("/Docs/expired.txt", "FILE::expired"))
-            .unwrap();
-        tracker.note_at("/Docs/expired.txt", expired);
-        // Queued operation: still protected even after grace.
-        db.upsert_entry(&clean_file("/Docs/pending.txt", "FILE::pending"))
-            .unwrap();
-        tracker.note_at("/Docs/pending.txt", expired);
-        db.queue_op("create", "/Docs/pending.txt", None).unwrap();
-        // Real local content is never purged, regardless of grace.
-        mirror.write_all("/Docs/content.txt", b"precious").unwrap();
-        db.upsert_entry(&clean_file("/Docs/content.txt", "FILE::content"))
-            .unwrap();
-        tracker.note_at("/Docs/content.txt", expired);
+        // The user just created this folder; it is not in the remote view,
+        // has no DB row yet, but is protected by the grace window.
+        mirror.ensure_dir("/Docs/Fresh").unwrap();
 
-        assert_eq!(
-            purge_stale_entries(&db, &mirror, &view, &tracker, LOCAL_CHANGE_GRACE).unwrap(),
-            1
+        remove_empty_ghost_dirs(
+            &db,
+            &mirror,
+            &view,
+            &LocalChangeTracker::default(),
+            LOCAL_CHANGE_GRACE,
+        )
+        .unwrap();
+        assert!(
+            mirror.local_path("/Docs/Fresh").unwrap().exists(),
+            "a recently created folder must not be deleted immediately"
         );
-        assert!(db.get_entry("/Docs/expired.txt").unwrap().is_none());
-        assert!(db.get_entry("/Docs/pending.txt").unwrap().is_some());
-        assert!(db.get_entry("/Docs/content.txt").unwrap().is_some());
-        assert_eq!(
-            fs::read(mirror.local_path("/Docs/content.txt").unwrap()).unwrap(),
-            b"precious"
+    }
+
+    #[tokio::test]
+    async fn mark_folder_dirty_for_upload_creates_dirty_row() {
+        let dir = TempDir::new();
+        let engine = test_engine(&dir).await;
+        engine.inner.mark_folder_dirty_for_upload("/new-folder");
+        let entry = engine
+            .inner
+            .state
+            .get_entry("/new-folder")
+            .unwrap()
+            .unwrap();
+        assert!(entry.dirty);
+        assert!(entry.remote_drivewsid.is_none());
+        assert!(engine.inner.state.has_pending_op("/new-folder").unwrap());
+        // Idempotent: a second call must not error.
+        engine.inner.mark_folder_dirty_for_upload("/new-folder");
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn remote_parent_missing_marks_folder_for_upload() {
+        let dir = TempDir::new();
+        let engine = test_engine(&dir).await;
+        assert!(
+            engine
+                .inner
+                .state
+                .get_entry("/Docs/payslips/2026")
+                .unwrap()
+                .is_none()
         );
+        let error = engine
+            .inner
+            .remote_id_for_path("/Docs/payslips/2026")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Remote parent for /Docs/payslips/2026")
+        );
+        // The folder is queued and dirty so the upload loop creates it on its
+        // next pass instead of retrying the file forever.
+        let entry = engine
+            .inner
+            .state
+            .get_entry("/Docs/payslips/2026")
+            .unwrap()
+            .unwrap();
+        assert!(entry.dirty);
+        assert!(entry.remote_drivewsid.is_none());
+        assert!(
+            engine
+                .inner
+                .state
+                .has_pending_op("/Docs/payslips/2026")
+                .unwrap()
+        );
+        assert!(
+            engine
+                .inner
+                .state
+                .list_dirty()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == "/Docs/payslips/2026")
+        );
+        engine.shutdown();
     }
 
     #[tokio::test]

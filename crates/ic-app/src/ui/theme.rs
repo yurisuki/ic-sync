@@ -6,7 +6,7 @@
 //! switches between Light and Dark (including the `System` preference).
 
 use crate::worker::LogLevel;
-use ic_core::status::SyncState;
+use ic_core::status::{ChangeKind, SyncState};
 use iced::theme::{self, Base};
 use iced::widget::{button, container};
 use iced::{Background, Border, Color, Theme};
@@ -166,6 +166,17 @@ pub fn status_text(level: LogLevel, dark: bool) -> Color {
     }
 }
 
+/// Colour for a file-change symbol: uploads look like successes, downloads
+/// like info, removals like warnings (red flags content gone).
+pub fn status_text_change(kind: ChangeKind, dark: bool) -> Color {
+    match kind {
+        ChangeKind::Added | ChangeKind::Uploaded | ChangeKind::Renamed => green(dark),
+        ChangeKind::Modified => blue(dark),
+        ChangeKind::Downloaded => green(dark),
+        ChangeKind::Removed => red(dark),
+    }
+}
+
 pub fn status_tint(state: &SyncState, dark: bool) -> Color {
     let base = status_color(state, dark);
     Color {
@@ -173,6 +184,24 @@ pub fn status_tint(state: &SyncState, dark: bool) -> Color {
         g: base.g,
         b: base.b,
         a: if dark { 0.22 } else { 0.14 },
+    }
+}
+
+/// Greyed-out overlay used while a code/login step is in flight: a translucent
+/// card behind the centered loading wheel.
+pub fn busy_overlay(theme: &Theme) -> container::Style {
+    let dark = is_dark(theme);
+    container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.5,
+            ..surface(dark)
+        })),
+        border: Border {
+            color: border(dark),
+            width: 1.0,
+            radius: CARD_RADIUS.into(),
+        },
+        ..Default::default()
     }
 }
 

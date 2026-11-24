@@ -4,6 +4,11 @@
 //! produced by the assets job).  Everything here degrades gracefully to a
 //! procedurally generated icon, so this crate compiles and runs even before the
 //! asset generation job has finished.
+//!
+//! Tray and window icons are the plain cloud asset tinted by `SyncState`:
+//! green when idle, orange while working, red on error, gray when offline.
+
+use ic_core::status::SyncState;
 
 /// Square icon size used for both the window and the tray.
 pub const ICON_SIZE: u32 = 64;
@@ -23,6 +28,50 @@ impl RgbaIcon {
 
     pub fn tray_icon(&self) -> Option<tray_icon::Icon> {
         tray_icon::Icon::from_rgba(self.rgba.clone(), self.width, self.height).ok()
+    }
+
+    /// Tray icon tinted and badged for the current sync state.
+    pub fn state_tray_icon(&self, state: SyncState) -> Option<tray_icon::Icon> {
+        state_variant(self, state).tray_icon()
+    }
+}
+
+/// Accent colour for each state, used to tint the plain cloud favicon.
+fn state_color(state: SyncState) -> Option<[u8; 3]> {
+    Some(match state {
+        // Idle: green.
+        SyncState::Synced => [46, 176, 101],
+        // Working: orange.
+        SyncState::Syncing
+        | SyncState::Relocating
+        | SyncState::LoginRequired => [240, 170, 40],
+        // Error: red.
+        SyncState::Error => [220, 70, 70],
+        // Not syncing at all: gray.
+        SyncState::Offline => [130, 140, 150],
+        SyncState::Unknown => return None,
+    })
+}
+
+/// Tint the plain cloud icon with the state colour. The original asset is
+/// left untouched for the `Unknown` state.
+fn state_variant(base: &RgbaIcon, state: SyncState) -> RgbaIcon {
+    let Some(color) = state_color(state) else {
+        return base.clone();
+    };
+    let mut rgba = base.rgba.clone();
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            continue;
+        }
+        pixel[0] = color[0];
+        pixel[1] = color[1];
+        pixel[2] = color[2];
+    }
+    RgbaIcon {
+        rgba,
+        width: base.width,
+        height: base.height,
     }
 }
 

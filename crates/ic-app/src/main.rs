@@ -55,12 +55,12 @@ fn main() -> iced::Result {
         .run()
 }
 
-fn daemon_view<'a>(app: &'a App, _window: iced::window::Id) -> iced::Element<'a, ui::Message> {
-    App::view(app)
+fn daemon_view<'a>(app: &'a App, window: iced::window::Id) -> iced::Element<'a, ui::Message> {
+    ui::view_for(app, window)
 }
 
-fn daemon_title(app: &App, _window: iced::window::Id) -> String {
-    ui::title(app)
+fn daemon_title(app: &App, window: iced::window::Id) -> String {
+    ui::title_for(app, window)
 }
 
 fn daemon_theme(app: &App, _window: iced::window::Id) -> iced::Theme {
@@ -77,6 +77,25 @@ pub(crate) fn window_settings() -> iced::window::Settings {
             width: 780.0,
             height: 580.0,
         }),
+        icon: icons::load().window_icon(),
+        ..Default::default()
+    }
+}
+
+/// Compact, always-on-top window used only for the 2FA code challenge. It is
+/// independent of the main window so a code prompt is never hidden behind it.
+pub(crate) fn two_factor_window_settings() -> iced::window::Settings {
+    iced::window::Settings {
+        size: iced::Size {
+            width: 470.0,
+            height: 460.0,
+        },
+        min_size: Some(iced::Size {
+            width: 400.0,
+            height: 360.0,
+        }),
+        resizable: false,
+        level: iced::window::Level::AlwaysOnTop,
         icon: icons::load().window_icon(),
         ..Default::default()
     }

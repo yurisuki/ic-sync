@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/ic-sync.svg" alt="IC-SYNC" width="112" height="112">
+  <img src="assets/ic-sync.png" alt="IC-SYNC" width="112" height="112">
 </p>
 
 <h1 align="center">IC-SYNC</h1>
